@@ -13,8 +13,32 @@ venv/
 .vscode/
 
 *.sqlite3
-*.db
 *.db-journal
+*.db-wal
+*.db-shm
+
+# Keep tracker.db but ignore other db files
+# tracker.db
+
+# Virtual environments
+.venv311/
+
+# Build artifacts  
+build/
+dist/*.exe
+*.zip
+*.spec
+
+# Cache and temp files
+cache/
+*.bak
+*.tmp
+
+# Test files
+test_*.py
+
+# Other
+AmazonPriceTrackerBot_v2.0.zip
 
 logs/
 *.log
