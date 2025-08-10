@@ -174,7 +174,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "🤖 <b>Available Commands</b>\n\n"
         "/list — Show tracked products with prices\n"
-        "/remove &lt;number&gt; — Remove product\n"
+        "/remove &lt;number&gt; — Remove specific product\n"
+        "/remove all — Remove all tracked products\n"
         "/help — Show this guide\n\n"
         "💡 <b>Tip:</b> Share an Amazon link to add it automatically!\n"
         "📢 <b>Notifications:</b> You'll be alerted when prices drop!",
@@ -246,7 +247,7 @@ async def handle_shared_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
             f"💰 <b>Current Price:</b> €{current_price:.2f}\n"
             f"📉 <b>Min Price:</b> €{corrected_min:.2f}\n"
             f"📈 <b>Max Price:</b> €{corrected_max:.2f}\n\n"
-            f"📢 <b>You'll be notified when the price drops!</b>"
+            f"📢 <b>You'll be notified when the price change!</b>"
         )
         
         await msg.edit_text(response, parse_mode="HTML", disable_web_page_preview=True)
@@ -350,19 +351,67 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await msg.edit_text("❌ Error fetching data")
 
 async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Remove tracked product"""
+    """Remove tracked product(s)"""
     await ensure_user_in_db(update)
     user = update.effective_user
     
-    if not context.args or not context.args[0].isdigit():
+    if not context.args:
         await update.message.reply_text(
-            "❌ <b>Usage:</b> /remove &lt;number&gt;\n\n"
+            "❌ <b>Usage:</b>\n"
+            "/remove &lt;number&gt; — Remove specific product\n"
+            "/remove all — Remove all products\n\n"
             "Use /list to see product numbers",
             parse_mode="HTML"
         )
         return
     
-    index = int(context.args[0]) - 1
+    arg = context.args[0].lower()
+    
+    # Handle "remove all" command
+    if arg == "all":
+        rows = db.list_items(user.id)
+        if not rows:
+            await update.message.reply_text(
+                "📦 <b>No products to remove!</b>\n\n"
+                "Your tracking list is already empty.",
+                parse_mode="HTML"
+            )
+            return
+        
+        # Remove all items directly
+        count = len(rows)
+        removed_count = 0
+        for item in rows:
+            if db.remove_item(user.id, item['id']):
+                removed_count += 1
+        
+        if removed_count > 0:
+            await update.message.reply_text(
+                f"✅ <b>Successfully removed {removed_count} products!</b>\n\n"
+                f"Your tracking list is now empty.",
+                parse_mode="HTML"
+            )
+            logger.info("Removed all products", user_id=user.id, count=removed_count)
+        else:
+            await update.message.reply_text(
+                "❌ Error removing products. Please try again.",
+                parse_mode="HTML"
+            )
+        return
+    
+    # Handle single product removal by number
+    if not arg.isdigit():
+        await update.message.reply_text(
+            "❌ <b>Invalid argument!</b>\n\n"
+            "<b>Usage:</b>\n"
+            "/remove &lt;number&gt; — Remove specific product\n"
+            "/remove all — Remove all products\n\n"
+            "Use /list to see product numbers",
+            parse_mode="HTML"
+        )
+        return
+    
+    index = int(arg) - 1
     rows = db.list_items(user.id)
     
     if index < 0 or index >= len(rows):
@@ -381,6 +430,7 @@ async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             f"✅ Removed: <b>{title}</b>",
             parse_mode="HTML"
         )
+        logger.info("Removed single product", user_id=user.id, item_id=item['id'], title=title)
     else:
         await update.message.reply_text(
             "❌ Error removing product. Please try again.",
