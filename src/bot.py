@@ -63,24 +63,27 @@ async def send_price_notification(user_id: int, asin: str, title: str, old_price
         # Check if it's a historical minimum
         is_historical_min = abs(new_price - min_price) < 0.01
         
+        hist_line = f"🏷️ <b>Historical Min:</b> €{min_price:.2f}" if min_price is not None else ""
         if is_historical_min:
-            # Historical minimum notification
+            # Historical minimum notification (include explicit min line)
             message = (
                 f"🔥 <b>HISTORICAL MINIMUM!</b> 🔥\n\n"
                 f"📦 {clickable_title}\n\n"
                 f"💰 <b>New Price:</b> €{new_price:.2f}\n"
                 f"📉 <b>Previous:</b> €{old_price:.2f}\n"
-                f"💡 <b>Savings:</b> €{old_price - new_price:.2f}\n\n"
+                f"💡 <b>Savings:</b> €{old_price - new_price:.2f}\n"
+                f"{hist_line}\n\n"
                 f"🎯 <b>This is the lowest price ever recorded!</b>"
             )
         else:
-            # Regular price drop notification
+            # Regular price drop notification (append historical min line)
             message = (
                 f"📉 <b>Price Drop Alert!</b>\n\n"
                 f"📦 {clickable_title}\n\n"
                 f"💰 <b>New Price:</b> €{new_price:.2f}\n"
                 f"📈 <b>Previous:</b> €{old_price:.2f}\n"
-                f"💡 <b>Savings:</b> €{old_price - new_price:.2f}"
+                f"💡 <b>Savings:</b> €{old_price - new_price:.2f}\n"
+                f"{hist_line}"
             )
         
         await app.bot.send_message(
