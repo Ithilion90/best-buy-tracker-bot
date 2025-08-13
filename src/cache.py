@@ -110,6 +110,16 @@ class KeepaCache:
         cache_key = f"minmax:{':'.join(sorted(asins))}"
         self.cache.set(cache_key, data, ttl)
     
+    def get_lifetime_minmax_current(self, asins: List[str]) -> Optional[Dict[str, Tuple[Optional[float], Optional[float], Optional[float]]]]:
+        """Get cached lifetime min/max/current for list of ASINs"""
+        cache_key = f"minmax_current:{':'.join(sorted(asins))}"
+        return self.cache.get(cache_key)
+    
+    def set_lifetime_minmax_current(self, asins: List[str], data: Dict[str, Tuple[Optional[float], Optional[float], Optional[float]]], ttl: float = 1800) -> None:
+        """Cache lifetime min/max/current for list of ASINs"""
+        cache_key = f"minmax_current:{':'.join(sorted(asins))}"
+        self.cache.set(cache_key, data, ttl)
+    
     def get_product_info(self, asin: str) -> Optional[Dict[str, Any]]:
         """Get cached product info for single ASIN"""
         cache_key = f"product:{asin}"

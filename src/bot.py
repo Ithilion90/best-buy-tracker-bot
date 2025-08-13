@@ -9,14 +9,14 @@ try:
     from src import db
     from src.config import config, validate_config
     from src.logger import logger
-    from src.keepa_client import fetch_lifetime_min_max
+    from src.keepa_client import fetch_lifetime_min_max, fetch_lifetime_min_max_current
     from src.utils import extract_asin, with_affiliate, truncate
     from src.price_fetcher import fetch_price_and_title
 except ImportError:
     import db
     from config import config, validate_config
     from logger import logger
-    from keepa_client import fetch_lifetime_min_max
+    from keepa_client import fetch_lifetime_min_max, fetch_lifetime_min_max_current
     from utils import extract_asin, with_affiliate, truncate
     from price_fetcher import fetch_price_and_title
 
@@ -117,18 +117,22 @@ async def check_price_changes(app: Application) -> None:
         
         # Fetch current prices from Keepa
         asins = list(asin_to_items.keys())
-        keepa_data = fetch_lifetime_min_max(asins)
+        keepa_data = fetch_lifetime_min_max_current(asins)
         
         for asin, items in asin_to_items.items():
             if asin not in keepa_data:
                 continue
             
-            min_price, max_price = keepa_data[asin]
+            min_price, max_price, current_price = keepa_data[asin]
             if not min_price or not max_price:
                 continue
             
-            # Calculate current price (average for now, could be improved)
-            current_price = (min_price + max_price) / 2
+            # Use current price from Keepa if available, otherwise fallback to average
+            if not current_price:
+                current_price = (min_price + max_price) / 2
+                logger.info("Using calculated average price as current price", asin=asin, avg_price=current_price)
+            else:
+                logger.info("Using Keepa current price", asin=asin, current_price=current_price)
             
             for item in items:
                 old_price = item.get('last_price')
@@ -160,7 +164,7 @@ async def check_price_changes(app: Application) -> None:
 async def periodic_price_check(app: Application) -> None:
     """Run periodic price checks every hour"""
     while True:
-        await asyncio.sleep(3600)  # Check every hour
+        await asyncio.sleep(10)  # Check every hour
         await check_price_changes(app)
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -216,12 +220,16 @@ async def handle_shared_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
             return
         
         # Get Keepa data
-        keepa_data = fetch_lifetime_min_max([asin])
-        min_price, max_price = keepa_data.get(asin, (None, None))
+        keepa_data = fetch_lifetime_min_max_current([asin])
+        min_price, max_price, current_price = keepa_data.get(asin, (None, None, None))
         
         if not min_price or not max_price:
             await msg.edit_text("❌ No price data found for this product")
             return
+        
+        # Use current price from Keepa if available, otherwise fallback to average
+        if not current_price:
+            current_price = (min_price + max_price) / 2
         
         # Validate price consistency - adjust min/max if needed but keep current price
         corrected_min, corrected_max = validate_price_consistency(current_price, min_price, max_price)
@@ -282,8 +290,8 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
         
         # Fetch fresh Keepa data
-        keepa_data = fetch_lifetime_min_max(asins)
-        logger.info("Fetched fresh Keepa data", asins_requested=len(asins), data_received=len(keepa_data))
+        keepa_data = fetch_lifetime_min_max_current(asins)
+        logger.info("Fetched fresh Keepa data with current prices", asins_requested=len(asins), data_received=len(keepa_data))
         
         lines = ["🛒 <b>Your Tracked Products:</b>\n"]
         
@@ -294,18 +302,19 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 
             # Get fresh Keepa data
             if asin in keepa_data:
-                min_price, max_price = keepa_data[asin]
+                min_price, max_price, current_price = keepa_data[asin]
                 
                 if min_price and max_price:
+                    # Use current price from Keepa if available, otherwise fallback to average
+                    if not current_price:
+                        current_price = (min_price + max_price) / 2
+                    
                     # Create clickable affiliate link with product title
                     title = truncate(r['title'] or f"Product {asin}", 40)
                     aff_url = with_affiliate(r['url'])
                     clickable_title = f"<a href=\"{aff_url}\">{title}</a>"
                     
-                    # Current price from database
-                    current_price = r.get('last_price', (min_price + max_price) / 2)
-                    
-                    # Apply price consistency validation
+                    # Apply price consistency validation using Keepa current price
                     if current_price:
                         corrected_min, corrected_max = validate_price_consistency(current_price, min_price, max_price)
                         
@@ -334,14 +343,14 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     
                     lines.append(line)
                 else:
-                    title = truncate(r['title'] or f"Product {asin}", 40)
-                    lines.append(f"{i}. {title} - ❌ Keepa data unavailable")
+                    title = truncate(r['title'] or f"Product {clickable_title}", 40)
+                    lines.append(f"{i}. {title} - ❌ Data unavailable")
             else:
-                title = truncate(r['title'] or f"Product {asin}", 40)
-                lines.append(f"{i}. {title} - ❌ Not found on Keepa")
-        
+                title = truncate(r['title'] or f"Product {clickable_title}", 40)
+                lines.append(f"{i}. {title} - ❌ Product not found")
+
         if len(lines) == 1:  # Only header
-            await msg.edit_text("❌ No Keepa data available for tracked products")
+            await msg.edit_text("❌ No data available for tracked products")
             return
         
         await msg.edit_text("\n\n".join(lines), parse_mode="HTML", disable_web_page_preview=True)

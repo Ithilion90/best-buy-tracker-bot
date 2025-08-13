@@ -47,6 +47,52 @@ def get_keepa_domain_name() -> str:
     return mapping.get(dom, "US")
 
 @retry_with_backoff(max_retries=3, exceptions=(Exception,))
+def fetch_lifetime_min_max_current(asin_list: List[str]) -> Dict[str, Tuple[Optional[float], Optional[float], Optional[float]]]:
+    """Return {asin: (min, max, current)} lifetime prices (Amazon price) in same currency.
+    Uses a 30 minute cache (1800s) to reduce API quota usage while keeping data reasonably fresh.
+    On error returns empty mapping or (None, None, None) entries so the caller can fallback.
+    """
+    key = (getattr(config, "keepa_api_key", "") or "").strip()
+    if not key or not asin_list:
+        return {}
+
+    # Check cache first (10 min TTL enforced when setting)
+    cached = keepa_cache.get_lifetime_minmax_current(asin_list)
+    if cached is not None:
+        logger.info("Using cached Keepa current/min/max data", asins=len(asin_list))
+        return cached
+
+    logger.info("Fetching Keepa data with current prices (cache miss)", asins=len(asin_list))
+
+    try:
+        # Primary: keepa package
+        result = circuit_breakers['keepa_api'].call(_fetch_from_keepa_package_with_current, key, asin_list)
+        if result:
+            keepa_cache.set_lifetime_minmax_current(asin_list, result, ttl=1800)  # 30 minutes
+            logger.info("Keepa current/min/max data fetched and cached", asins=len(asin_list), results=len(result), ttl_seconds=1800)
+        return result
+    except ImportError:
+        # Fallback: pykeepa
+        try:
+            result = _fetch_from_pykeepa_with_current(key, asin_list)
+            if result:
+                keepa_cache.set_lifetime_minmax_current(asin_list, result, ttl=1800)
+            return result
+        except ImportError:
+            # Final fallback: raw HTTP
+            try:
+                result = circuit_breakers['keepa_api'].call(_fetch_via_http_with_current, asin_list, key)
+                if result:
+                    keepa_cache.set_lifetime_minmax_current(asin_list, result, ttl=1800)
+                return result
+            except Exception as e:
+                logger.error("All Keepa methods failed", error=str(e))
+                return {asin: (None, None, None) for asin in asin_list}
+    except Exception as e:
+        logger.error("Keepa API failed", error=str(e), asins=len(asin_list))
+        return {asin: (None, None, None) for asin in asin_list}
+
+@retry_with_backoff(max_retries=3, exceptions=(Exception,))
 def fetch_lifetime_min_max(asin_list: List[str]) -> Dict[str, Tuple[Optional[float], Optional[float]]]:
     """Return {asin: (min, max)} lifetime (price type: Amazon price) in same currency.
     Requires KEEPA_API_KEY in config; on error returns {} or missing keys.
@@ -95,13 +141,41 @@ def fetch_lifetime_min_max(asin_list: List[str]) -> Dict[str, Tuple[Optional[flo
         logger.error("Keepa API failed", error=str(e), asins=len(asin_list))
         return {asin: (None, None) for asin in asin_list}
 
+def _fetch_from_keepa_package_with_current(key: str, asin_list: List[str]) -> Dict[str, Tuple[Optional[float], Optional[float], Optional[float]]]:
+    """Fetch from keepa package with current prices"""
+    api = keepa.Keepa(key)
+    products_resp = api.query(
+        asin_list, 
+        domain=get_keepa_domain_name(), 
+        stats=1800,
+        history=False
+    )
+    products = _normalize_products(products_resp)
+    return _parse_keepa_products_with_current(products)
+
+def _fetch_from_pykeepa_with_current(key: str, asin_list: List[str]) -> Dict[str, Tuple[Optional[float], Optional[float], Optional[float]]]:
+    """Fetch from pykeepa with current prices"""
+    import pykeepa  # type: ignore
+    try:
+        products_resp = pykeepa.query(
+            key,
+            asin_list,
+            stats=1800,
+            domain=get_keepa_domain_id(),
+            history=True,
+        )
+    except Exception:
+        products_resp = []
+    products = _normalize_products(products_resp)
+    return _parse_keepa_products_with_current(products)
+
 def _fetch_from_keepa_package(key: str, asin_list: List[str]) -> Dict[str, Tuple[Optional[float], Optional[float]]]:
     """Fetch from keepa package"""
     api = keepa.Keepa(key)
     products_resp = api.query(
         asin_list, 
         domain=get_keepa_domain_name(), 
-        stats=365,
+        stats=1800,
         history=False
     )
     products = _normalize_products(products_resp)
@@ -114,7 +188,7 @@ def _fetch_from_pykeepa(key: str, asin_list: List[str]) -> Dict[str, Tuple[Optio
         products_resp = pykeepa.query(
             key,
             asin_list,
-            stats=365,
+            stats=1800,
             domain=get_keepa_domain_id(),
             history=True,
         )
@@ -191,6 +265,95 @@ def _normalize_products(products_resp) -> List[dict]:
         return [p for p in products_resp if isinstance(p, dict)]
     return []
 
+
+def _parse_keepa_products_with_current(products: List[dict]) -> Dict[str, Tuple[Optional[float], Optional[float], Optional[float]]]:
+    """Parse Keepa products to extract min, max, and current prices"""
+    out: Dict[str, Tuple[Optional[float], Optional[float], Optional[float]]] = {}
+    for p in products or []:
+        asin = (p.get('asin') or '').strip()
+        if not asin:
+            continue
+            
+        stats = p.get('stats') or {}
+        raw_min = None
+        raw_max = None
+        raw_current = None
+        
+        # Try to get min/max/current from stats if available
+        if stats:
+            # Collect all valid prices from min/max/current stats arrays
+            min_prices = []
+            max_prices = []
+            current_prices = []
+            
+            # Extract prices from current stats (use same logic as min/max, but with debug)
+            if 'current' in stats:
+                stat_array = stats['current']
+                #logger.info("Debug current stats", asin=asin, current_type=type(stat_array), current_value=stat_array)
+                
+                if isinstance(stat_array, (list, tuple)) and len(stat_array) > 0:
+                    item = stat_array[1]  # First slot = current data
+                    #logger.info("Debug current item", asin=asin, item_type=type(item), item_value=item)
+                    
+                    if isinstance(item, (list, tuple)) and len(item) >= 2:
+                        price = item[1]  # Second element is price in cents
+                        if isinstance(price, (int, float)) and price > 100:  # Filter out prices < €1.00
+                            current_prices.append(float(price))
+                            #logger.info("Found current price from array", asin=asin, price=price)
+                    elif isinstance(item, (int, float)) and item > 100:
+                        # Handle case where item is directly a price value
+                        current_prices.append(float(item))
+                        #logger.info("Found current price as direct value", asin=asin, price=item)
+                elif isinstance(stat_array, (int, float)) and stat_array > 100:
+                    # Handle case where current is directly a price value
+                    current_prices.append(float(stat_array))
+                    #logger.info("Found current price as direct stat", asin=asin, price=stat_array)
+
+            # Extract prices from min stats (use only first slot which is long-term historical)
+            if 'min' in stats:
+                stat_array = stats['min']
+                if isinstance(stat_array, (list, tuple)) and len(stat_array) > 0:
+                    item = stat_array[0]  # First slot = long-term historical data
+                    if isinstance(item, (list, tuple)) and len(item) >= 2:
+                        price = item[1]  # Second element is price in cents
+                        if isinstance(price, (int, float)) and price > 100:  # Filter out prices < €1.00
+                            min_prices.append(float(price))
+            
+            # Extract prices from max stats (use only first slot which is long-term historical)
+            if 'max' in stats:
+                stat_array = stats['max']
+                if isinstance(stat_array, (list, tuple)) and len(stat_array) > 0:
+                    item = stat_array[0]  # First slot = long-term historical data
+                    if isinstance(item, (list, tuple)) and len(item) >= 2:
+                        price = item[1]  # Second element is price in cents
+                        if isinstance(price, (int, float)) and price > 100:  # Filter out prices < €1.00
+                            max_prices.append(float(price))
+            
+            # Calculate actual min/max/current
+            if min_prices:
+                raw_min = min(min_prices)
+            if max_prices:
+                raw_max = max(max_prices)
+            if current_prices:
+                raw_current = current_prices[0]  # Take first (and likely only) current price            # If min/max not found in stats, try current price as fallback
+            if (not isinstance(raw_min, (int, float)) or raw_min <= 0) and isinstance(raw_current, (int, float)) and raw_current > 0:
+                raw_min = raw_max = raw_current
+        
+        # If stats don't provide valid data, try history arrays
+        if not isinstance(raw_min, (int, float)) or not isinstance(raw_max, (int, float)) or raw_min <= 0 or raw_max <= 0:
+            hmin, hmax = _minmax_from_history(p)
+            if not isinstance(raw_min, (int, float)) or raw_min <= 0:
+                raw_min = hmin
+            if not isinstance(raw_max, (int, float)) or raw_max <= 0:
+                raw_max = hmax
+        
+        # Convert from cents to euros and round
+        min_price = round(raw_min / 100.0, 2) if isinstance(raw_min, (int, float)) and raw_min > 0 else None
+        max_price = round(raw_max / 100.0, 2) if isinstance(raw_max, (int, float)) and raw_max > 0 else None
+        current_price = round(raw_current / 100.0, 2) if isinstance(raw_current, (int, float)) and raw_current > 0 else None
+        
+        out[asin] = (min_price, max_price, current_price)
+    return out
 
 def _parse_keepa_products(products: List[dict]) -> Dict[str, Tuple[Optional[float], Optional[float]]]:
     out: Dict[str, Tuple[Optional[float], Optional[float]]] = {}
@@ -289,6 +452,31 @@ def _minmax_from_history(product: dict) -> Tuple[Optional[float], Optional[float
         return None, None
     return (min(values), max(values))
 
+
+def _fetch_via_http_with_current(asin_list: List[str], api_key: str) -> Dict[str, Tuple[Optional[float], Optional[float], Optional[float]]]:
+    import httpx  # lazy import
+    params = {
+        "key": api_key,
+        "domain": str(get_keepa_domain_id()),
+        "asin": ",".join(asin_list[:100]),  # Keepa has limits; batch up to 100
+        "stats": "1800",
+        "history": "1",
+    }
+    url = "https://api.keepa.com/product"
+    timeout = getattr(config, "request_timeout_seconds", 20) or 20
+    with httpx.Client(timeout=timeout) as client:
+        resp = client.get(url, params=params)
+        resp.raise_for_status()
+        data = resp.json()
+    products = data.get("products") or []
+    # Normalize to the same structure parser expects
+    norm = []
+    for p in products:
+        norm.append({
+            "asin": p.get("asin"),
+            "stats": p.get("stats", {}),
+        })
+    return _parse_keepa_products_with_current(norm)
 
 def _fetch_via_http(asin_list: List[str], api_key: str) -> Dict[str, Tuple[Optional[float], Optional[float]]]:
     import httpx  # lazy import
