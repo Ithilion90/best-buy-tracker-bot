@@ -298,15 +298,15 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         # Get all ASINs for fresh Keepa lookup
         asins = [r['asin'] for r in rows if r.get('asin')]
-        
+
         if not asins:
             await msg.edit_text("❌ No valid ASINs found in tracked products")
             return
-        
-        # Fetch fresh Keepa data
+
+        # Fetch Keepa data (min/max + maybe current)
         keepa_data = fetch_lifetime_min_max_current(asins)
-        logger.info("Fetched fresh Keepa data with current prices", asins_requested=len(asins), data_received=len(keepa_data))
-        
+        logger.info("Fetched Keepa data for list view", asins_requested=len(asins), data_received=len(keepa_data))
+
         lines = ["🛒 <b>Your Tracked Products:</b>\n"]
         
         for i, r in enumerate(rows, 1):
