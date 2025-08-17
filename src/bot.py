@@ -23,13 +23,13 @@ except ImportError:
     from cache import keepa_cache  # added
 
 AMAZON_URL_RE = re.compile(
-    r'(https?://(?:www\.)?(?:amzn\.to|amzn\.eu|amzn\.in|amazon\.(?:com|co\.uk|de|fr|it|es|ca|co\.jp|in|com\.mx))/[^\s]+)',
+    r'(https?://(?:www\.)?(?:amzn\.to|amzn\.eu|amzn\.in|a\.co|amazon\.(?:com|co\.uk|de|fr|it|es|ca|co\.jp|in|com\.mx))/[^\s]+)',
     re.IGNORECASE,
 )
 
 def validate_amazon_url(url: str) -> bool:
     """Validate Amazon URL"""
-    supported_domains = ['amazon.com', 'amazon.co.uk', 'amazon.de', 'amazon.fr', 'amazon.it', 'amazon.es', 'amazon.ca', 'amazon.co.jp', 'amazon.in', 'amazon.com.mx', 'amzn.to', 'amzn.eu', 'amzn.in']
+    supported_domains = ['amazon.com', 'amazon.co.uk', 'amazon.de', 'amazon.fr', 'amazon.it', 'amazon.es', 'amazon.ca', 'amazon.co.jp', 'amazon.in', 'amazon.com.mx', 'amzn.to', 'amzn.eu', 'amzn.in', 'a.co']
     return any(domain in url.lower() for domain in supported_domains)
 
 def validate_price_consistency(current_price: float, min_price: float, max_price: float) -> tuple[float, float]:

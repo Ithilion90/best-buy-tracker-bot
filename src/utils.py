@@ -69,7 +69,7 @@ def with_affiliate(url: str) -> str:
         return url
 
 # --- New helpers for Amazon App shared links / short links ---
-SHORT_AMAZON_DOMAINS = {"amzn.to", "amzn.eu", "amzn.in", "amzn.asia"}
+SHORT_AMAZON_DOMAINS = {"amzn.to", "amzn.eu", "amzn.in", "amzn.asia", "a.co"}
 
 def is_short_amazon(url: str) -> bool:
     try:
@@ -87,8 +87,17 @@ async def expand_short_amazon_url(url: str, timeout: int = 10) -> str:
     """
     if not is_short_amazon(url):
         return url
+    headers = {"User-Agent": config.user_agent, "Accept-Language": "en-US,en;q=0.9"}
     try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=timeout, headers={"User-Agent": config.user_agent}) as client:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=timeout, headers=headers) as client:
+            # First try HEAD to reduce bandwidth
+            try:
+                head_resp = await client.head(url)
+                if head_resp.is_redirect:
+                    return str(head_resp.next_request.url) if head_resp.next_request else str(head_resp.url)
+            except Exception:
+                pass
+            # Fallback to GET
             resp = await client.get(url)
             return str(resp.url)
     except Exception:
