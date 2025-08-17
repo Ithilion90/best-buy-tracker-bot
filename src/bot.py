@@ -173,7 +173,8 @@ async def refresh_cache_and_notify(app: Application) -> None:
 async def periodic_price_check(app: Application) -> None:
     while True:
         await refresh_cache_and_notify(app)
-        await asyncio.sleep(33)
+    # Sleep for 30 minutes between refresh cycles (1800 seconds)
+    await asyncio.sleep(1800)
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Start command - automatically shows help"""
@@ -329,7 +330,7 @@ async def handle_shared_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 "ts": time.time()
             })
         except Exception as e:
-            logger.warning("Failed to update keepa cache on add", asin=asin, error=str(e))
+            logger.warning("Failed to update keepa cache on add", asin=asin, ehandle_shared_linkrror=str(e))
         await msg.edit_text(response, parse_mode="HTML", disable_web_page_preview=True)
         logger.info("Product added via shared link", asin=asin, title=title[:30], current_price=current_price, min_price=corrected_min, max_price=corrected_max)
         
