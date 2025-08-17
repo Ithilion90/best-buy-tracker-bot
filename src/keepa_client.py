@@ -281,44 +281,63 @@ def _parse_keepa_products_with_current(products: List[dict]) -> Dict[str, Tuple[
         
         # Try to get min/max/current from stats if available
         if stats:
-            # Collect valid prices
-            min_prices: List[float] = []
-            max_prices: List[float] = []
-
-            # Current price: in Keepa stats the first element of 'current' array is Amazon current price (in cents)
+            # Collect all valid prices from min/max/current stats arrays
+            min_prices = []
+            max_prices = []
+            current_prices = []
+            
+            # Extract prices from current stats (use same logic as min/max, but with debug)
             if 'current' in stats:
-                cur = stats['current']
-                if isinstance(cur, (list, tuple)) and cur:
-                    cand = cur[0]
-                    if isinstance(cand, (int, float)) and cand > 0:
-                        raw_current = float(cand)
-                elif isinstance(cur, (int, float)) and cur > 0:
-                    raw_current = float(cur)
+                stat_array = stats['current']
+                #logger.info("Debug current stats", asin=asin, current_type=type(stat_array), current_value=stat_array)
+                
+                if isinstance(stat_array, (list, tuple)) and len(stat_array) > 0:
+                    item = stat_array[1]  # First slot = current data
+                    #logger.info("Debug current item", asin=asin, item_type=type(item), item_value=item)
+                    
+                    if isinstance(item, (list, tuple)) and len(item) >= 2:
+                        price = item[1]  # Second element is price in cents
+                        if isinstance(price, (int, float)) and price > 100:  # Filter out prices < €1.00
+                            current_prices.append(float(price))
+                            #logger.info("Found current price from array", asin=asin, price=price)
+                    elif isinstance(item, (int, float)) and item > 100:
+                        # Handle case where item is directly a price value
+                        current_prices.append(float(item))
+                        #logger.info("Found current price as direct value", asin=asin, price=item)
+                elif isinstance(stat_array, (int, float)) and stat_array > 100:
+                    # Handle case where current is directly a price value
+                    current_prices.append(float(stat_array))
+                    #logger.info("Found current price as direct stat", asin=asin, price=stat_array)
 
-            # Min array: first element (index 0) is [price, time] pair for Amazon lifetime min
+            # Extract prices from min stats (use only first slot which is long-term historical)
             if 'min' in stats:
                 stat_array = stats['min']
-                if isinstance(stat_array, (list, tuple)) and stat_array:
-                    first = stat_array[0]
-                    if isinstance(first, (list, tuple)) and len(first) >= 2 and isinstance(first[1], (int, float)) and first[1] > 0:
-                        min_prices.append(float(first[1]))
-            # Max array analogous
+                if isinstance(stat_array, (list, tuple)) and len(stat_array) > 0:
+                    item = stat_array[0]  # First slot = long-term historical data
+                    if isinstance(item, (list, tuple)) and len(item) >= 2:
+                        price = item[1]  # Second element is price in cents
+                        if isinstance(price, (int, float)) and price > 100:  # Filter out prices < €1.00
+                            min_prices.append(float(price))
+            
+            # Extract prices from max stats (use only first slot which is long-term historical)
             if 'max' in stats:
                 stat_array = stats['max']
-                if isinstance(stat_array, (list, tuple)) and stat_array:
-                    first = stat_array[0]
-                    if isinstance(first, (list, tuple)) and len(first) >= 2 and isinstance(first[1], (int, float)) and first[1] > 0:
-                        max_prices.append(float(first[1]))
-
+                if isinstance(stat_array, (list, tuple)) and len(stat_array) > 0:
+                    item = stat_array[0]  # First slot = long-term historical data
+                    if isinstance(item, (list, tuple)) and len(item) >= 2:
+                        price = item[1]  # Second element is price in cents
+                        if isinstance(price, (int, float)) and price > 100:  # Filter out prices < €1.00
+                            max_prices.append(float(price))
+            
+            # Calculate actual min/max/current
             if min_prices:
                 raw_min = min(min_prices)
             if max_prices:
                 raw_max = max(max_prices)
-            # Fallback: if no min/max but we have current, seed them with current
+            if current_prices:
+                raw_current = current_prices[0]  # Take first (and likely only) current price            # If min/max not found in stats, try current price as fallback
             if (not isinstance(raw_min, (int, float)) or raw_min <= 0) and isinstance(raw_current, (int, float)) and raw_current > 0:
-                raw_min = raw_current
-            if (not isinstance(raw_max, (int, float)) or raw_max <= 0) and isinstance(raw_current, (int, float)) and raw_current > 0:
-                raw_max = raw_current
+                raw_min = raw_max = raw_current
         
         # If stats don't provide valid data, try history arrays
         if not isinstance(raw_min, (int, float)) or not isinstance(raw_max, (int, float)) or raw_min <= 0 or raw_max <= 0:

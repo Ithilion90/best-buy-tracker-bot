@@ -23,13 +23,13 @@ except ImportError:
     from cache import keepa_cache  # added
 
 AMAZON_URL_RE = re.compile(
-    r'(https?://(?:www\.)?(?:amzn\.to|amzn\.eu|amzn\.in|a\.co|amazon\.(?:com|co\.uk|de|fr|it|es|ca|co\.jp|in|com\.mx))/[^\s]+)',
+    r'(https?://(?:www\.)?(?:amzn\.to|amzn\.eu|amzn\.in|amazon\.(?:com|co\.uk|de|fr|it|es|ca|co\.jp|in|com\.mx))/[^\s]+)',
     re.IGNORECASE,
 )
 
 def validate_amazon_url(url: str) -> bool:
     """Validate Amazon URL"""
-    supported_domains = ['amazon.com', 'amazon.co.uk', 'amazon.de', 'amazon.fr', 'amazon.it', 'amazon.es', 'amazon.ca', 'amazon.co.jp', 'amazon.in', 'amazon.com.mx', 'amzn.to', 'amzn.eu', 'amzn.in', 'a.co']
+    supported_domains = ['amazon.com', 'amazon.co.uk', 'amazon.de', 'amazon.fr', 'amazon.it', 'amazon.es', 'amazon.ca', 'amazon.co.jp', 'amazon.in', 'amazon.com.mx', 'amzn.to', 'amzn.eu', 'amzn.in']
     return any(domain in url.lower() for domain in supported_domains)
 
 def validate_price_consistency(current_price: float, min_price: float, max_price: float) -> tuple[float, float]:
@@ -103,91 +103,76 @@ async def send_price_notification(user_id: int, asin: str, title: str, old_price
     except Exception as e:
         logger.error("Error sending notification", error=str(e), user_id=user_id, asin=asin)
 
-async def check_price_changes(app: Application) -> None:
-    """Check for price changes and send notifications"""
+async def refresh_cache_and_notify(app: Application) -> None:
+    """Refresh price cache every cycle with scraped current price and Keepa bounds, send notifications."""
     try:
-        # Get all tracked items
-        all_items = db.get_all_items()
-        if not all_items: 
+        items = db.get_all_items()
+        if not items:
             return
-        # Grouping logic remains
-        asin_to_items = {}
-        for item in all_items:
-            asin = item.get('asin')
-            if asin:
-                asin_to_items.setdefault(asin, []).append(item)
-        if not asin_to_items:
+        asin_map: dict[str, list[dict]] = {}
+        for it in items:
+            a = it.get('asin')
+            if a:
+                asin_map.setdefault(a, []).append(it)
+        if not asin_map:
             return
-        asins = list(asin_to_items.keys())
-        keepa_data = fetch_lifetime_min_max_current(asins)
-        # Scrape tasks
-        scrape_tasks = {}
-        for asin, items in asin_to_items.items():
-            sample_url = items[0].get('url')
-            if sample_url:
-                scrape_tasks[asin] = asyncio.create_task(fetch_price_and_title(sample_url))
-        scrape_results = {}
-        if scrape_tasks:
-            for asin, task in scrape_tasks.items():
+        asins = list(asin_map.keys())
+        keepa_bounds = fetch_lifetime_min_max_current(asins)
+        # Scrape current concurrently
+        sem = asyncio.Semaphore(10)
+        async def scrape(asin: str, url: str):
+            async with sem:
                 try:
-                    title_s, scraped_price, _currency = await task
-                    scrape_results[asin] = (title_s, scraped_price)
+                    title_s, price_s, _c = await fetch_price_and_title(url)
+                    return asin, title_s, price_s
                 except Exception as e:
-                    logger.warning("Scrape failed", asin=asin, error=str(e))
-        cache_updates = {}  # new
-        for asin, items in asin_to_items.items():
-            keepa_entry = keepa_data.get(asin)
-            if not keepa_entry:
-                continue
-            min_price, max_price, keepa_current = keepa_entry
-            if not min_price or not max_price:
-                continue
+                    logger.warning("Refresh scrape failed", asin=asin, error=str(e))
+                    return asin, None, None
+        tasks = [scrape(a, lst[0]['url']) for a, lst in asin_map.items() if lst and lst[0].get('url')]
+        scrape_results = {}
+        if tasks:
+            for asin, t, p in await asyncio.gather(*tasks):
+                scrape_results[asin] = (t, p)
+        cache_updates = {}
+        for asin, lst in asin_map.items():
+            k_min, k_max, k_cur = keepa_bounds.get(asin, (None, None, None)) if keepa_bounds else (None, None, None)
             scraped_title, scraped_price = scrape_results.get(asin, (None, None))
-            if scraped_price:
-                current_price = scraped_price
-                source = "scrape"
-            elif keepa_current:
-                current_price = keepa_current
-                source = "keepa"
-            else:
-                current_price = (min_price + max_price) / 2
-                source = "avg"
-            logger.info("Resolved current price", asin=asin, source=source, current=current_price)
-            adj_min, adj_max = validate_price_consistency(current_price, min_price, max_price)
-            cache_updates[asin] = (min_price, max_price, current_price)  # record authoritative current
-            for item in items:
+            if k_min is None or k_max is None:
+                if scraped_price is not None:
+                    k_min = k_max = scraped_price
+                else:
+                    lp = lst[0].get('last_price')
+                    if isinstance(lp, (int, float)):
+                        k_min = k_max = lp
+            if k_min is None or k_max is None:
+                continue
+            current_price = scraped_price if scraped_price is not None else (k_cur if k_cur is not None else (k_min + k_max) / 2)
+            adj_min, adj_max = validate_price_consistency(current_price, k_min, k_max)
+            cache_updates[asin] = (adj_min, adj_max, current_price)
+            for item in lst:
                 old_price = item.get('last_price')
-                if not isinstance(old_price, (int, float)):
-                    continue
-                price_drop = old_price - current_price
-                if price_drop > 1.0 or (price_drop / old_price) > 0.05:
-                    await send_price_notification(
-                        user_id=item['user_id'],
-                        asin=asin,
-                        title=item['title'] or (scraped_title or f"Product {asin}"),
-                        old_price=old_price,
-                        new_price=current_price,
-                        min_price=adj_min,
-                        app=app
-                    )
-                    try:
-                        db.update_price(item['id'], current_price)
-                    except Exception as e:
-                        logger.warning("DB update failed", item_id=item['id'], error=str(e))
+                if isinstance(old_price, (int, float)):
+                    drop = old_price - current_price
+                    if drop > 1.0 or (old_price > 0 and drop / old_price > 0.05):
+                        await send_price_notification(item['user_id'], asin, item['title'] or (scraped_title or f"Product {asin}"), old_price, current_price, adj_min, app)
+                try:
+                    db.update_price_bounds(item['id'], adj_min, adj_max)
+                    db.update_price(item['id'], current_price)
+                except Exception as e:
+                    logger.warning("Refresh DB update failed", item_id=item['id'], error=str(e))
         if cache_updates:
             try:
-                keepa_cache.set_lifetime_minmax_current(list(cache_updates.keys()), cache_updates)
+                keepa_cache.set_lifetime_minmax_current(asins, cache_updates)
             except Exception as e:
-                logger.warning("Failed to update keepa cache after price check", error=str(e))
-        logger.info("Price check completed", items_checked=len(all_items), asins_checked=len(asins), cache_updates=len(cache_updates))
+                logger.warning("Refresh cache write failed", error=str(e))
+        logger.info("Refresh cycle complete", asins=len(cache_updates))
     except Exception as e:
-        logger.error("Error in price check", error=str(e))
+        logger.error("Refresh cycle error", error=str(e))
 
 async def periodic_price_check(app: Application) -> None:
-    """Run periodic price checks every hour"""
     while True:
-        await asyncio.sleep(10)  # Check every hour
-        await check_price_changes(app)
+        await refresh_cache_and_notify(app)
+        await asyncio.sleep(33)
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Start command - automatically shows help"""
@@ -346,82 +331,51 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
     
-    msg = await update.message.reply_text("🔍 Fetching updated data...")
+    msg = await update.message.reply_text("🔍 Fetching cached data...")
     
     try:
-        # Get all ASINs for fresh Keepa lookup
+        # Use cache only
         asins = [r['asin'] for r in rows if r.get('asin')]
-
         if not asins:
             await msg.edit_text("❌ No valid ASINs found in tracked products")
             return
-
-        # Fetch Keepa data (min/max + maybe current)
-        keepa_data = fetch_lifetime_min_max_current(asins)
-        logger.info("Fetched Keepa data for list view", asins_requested=len(asins), data_received=len(keepa_data))
-
+        cached = keepa_cache.get_lifetime_minmax_current(asins)
         lines = ["🛒 <b>Your Tracked Products:</b>\n"]
-        
         for i, r in enumerate(rows, 1):
             asin = r.get('asin')
             if not asin:
                 continue
-                
-            # Get fresh Keepa data
-            if asin in keepa_data:
-                min_price, max_price, current_price = keepa_data[asin]
-                
-                if min_price and max_price:
-                    # Use current price from Keepa if available, otherwise fallback to average
-                    if not current_price:
-                        current_price = (min_price + max_price) / 2
-                    
-                    # Create clickable affiliate link with product title
-                    title = truncate(r['title'] or f"Product {asin}", 40)
-                    aff_url = with_affiliate(r['url'])
-                    clickable_title = f"<a href=\"{aff_url}\">{title}</a>"
-                    
-                    # Apply price consistency validation using Keepa current price
-                    if current_price:
-                        corrected_min, corrected_max = validate_price_consistency(current_price, min_price, max_price)
-                        
-                        # Update database if corrections were made
-                        if corrected_min != min_price or corrected_max != max_price:
-                            # Update min/max in database
-                            try:
-                                db.update_price_bounds(r['id'], corrected_min, corrected_max)
-                                logger.info("Updated price consistency in list", 
-                                          item_id=r['id'], 
-                                          old_min=min_price, new_min=corrected_min,
-                                          old_max=max_price, new_max=corrected_max,
-                                          current=current_price)
-                            except Exception as e:
-                                logger.warning("Failed to update price consistency", error=str(e), item_id=r['id'])
-                        
-                        # Use corrected values for display
-                        display_min, display_max = corrected_min, corrected_max
-                    else:
-                        display_min, display_max = min_price, max_price
-                    
-                    line = f"{i}. {clickable_title}\n"
-                    line += f"   💰 <b>Current:</b> €{current_price:.2f}\n"
-                    line += f"   📉 <b>Min:</b> €{display_min:.2f}\n"
-                    line += f"   📈 <b>Max:</b> €{display_max:.2f}"
-                    
-                    lines.append(line)
-                else:
-                    title = truncate(r['title'] or f"Product {clickable_title}", 40)
-                    lines.append(f"{i}. {title} - ❌ Data unavailable")
-            else:
-                title = truncate(r['title'] or f"Product {clickable_title}", 40)
-                lines.append(f"{i}. {title} - ❌ Product not found")
-
-        if len(lines) == 1:  # Only header
+            triple = cached.get(asin) if cached and isinstance(cached, dict) else None
+            min_p = max_p = cur_p = None
+            if triple and isinstance(triple, (list, tuple)) and len(triple) == 3:
+                min_p, max_p, cur_p = triple
+            if not (min_p and max_p and cur_p):
+                prod_info = keepa_cache.get_product_info(asin)
+                if prod_info:
+                    cur_p = cur_p or prod_info.get('current')
+                    min_p = min_p or prod_info.get('adj_min') or prod_info.get('min')
+                    max_p = max_p or prod_info.get('adj_max') or prod_info.get('max')
+            if not min_p or not max_p:
+                min_p = r.get('min_price')
+                max_p = r.get('max_price')
+            if not cur_p:
+                cur_p = r.get('last_price') or (min_p and max_p and (min_p + max_p) / 2)
+            if not (isinstance(min_p, (int, float)) and isinstance(max_p, (int, float)) and isinstance(cur_p, (int, float))):
+                title = truncate(r['title'] or f"Product {asin}", 40)
+                lines.append(f"{i}. {title} - ❌ Data unavailable yet")
+                continue
+            title_disp = truncate(r['title'] or f"Product {asin}", 40)
+            aff_url = with_affiliate(r['url'])
+            clickable = f"<a href=\"{aff_url}\">{title_disp}</a>"
+            line = f"{i}. {clickable}\n"
+            line += f"   💰 <b>Current:</b> €{cur_p:.2f}\n"
+            line += f"   📉 <b>Min:</b> €{min_p:.2f}\n"
+            line += f"   📈 <b>Max:</b> €{max_p:.2f}"
+            lines.append(line)
+        if len(lines) == 1:
             await msg.edit_text("❌ No data available for tracked products")
             return
-        
         await msg.edit_text("\n\n".join(lines), parse_mode="HTML", disable_web_page_preview=True)
-        
     except Exception as e:
         logger.error("Error in list command", error=str(e))
         await msg.edit_text("❌ Error fetching data")
