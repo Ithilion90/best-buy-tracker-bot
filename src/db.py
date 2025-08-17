@@ -76,6 +76,7 @@ def _create_fresh_schema(conn):
             user_id INTEGER NOT NULL,
             url TEXT NOT NULL,
             asin TEXT,
+            domain TEXT, -- Amazon domain (e.g. amazon.it, amazon.de) to distinguish regional listings
             title TEXT,
             currency TEXT DEFAULT 'EUR',
             last_price REAL,
@@ -145,7 +146,8 @@ def _migrate_existing_schema(conn):
         'notification_sent_at': 'TIMESTAMP',
         'category': 'TEXT',
         'priority': 'INTEGER DEFAULT 1',
-        'is_active': 'BOOLEAN DEFAULT 1'
+        'is_active': 'BOOLEAN DEFAULT 1',
+        'domain': 'TEXT'
     }
     
     for column_name, column_def in new_columns.items():
@@ -217,13 +219,13 @@ def ensure_user(user_id: int, username: str = None, first_name: str = None, last
         
         conn.commit()
 
-def add_item(user_id: int, url: str, asin: str, title: str, currency: str, price: Optional[float], target_price: Optional[float] = None, category: str = None, priority: int = 1) -> int:
-    """Add item with enhanced tracking"""
+def add_item(user_id: int, url: str, asin: str, title: str, currency: str, price: Optional[float], target_price: Optional[float] = None, category: str = None, priority: int = 1, domain: Optional[str] = None) -> int:
+    """Add item with enhanced tracking (domain-aware)"""
     with get_db_connection() as conn:
         cursor = conn.execute("""
-            INSERT INTO items (user_id, url, asin, title, currency, last_price, min_price, max_price, target_price, category, priority, last_checked, check_count)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 1)
-        """, (user_id, url, asin, title, currency, price, price, price, target_price, category, priority))
+            INSERT INTO items (user_id, url, asin, domain, title, currency, last_price, min_price, max_price, target_price, category, priority, last_checked, check_count)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 1)
+        """, (user_id, url, asin, domain, title, currency, price, price, price, target_price, category, priority))
         
         item_id = cursor.lastrowid
         
@@ -262,15 +264,21 @@ def list_items(user_id: int, include_inactive: bool = False) -> List[Dict[str, A
         
         return [dict(row) for row in rows]
 
-def get_item_by_user_and_asin(user_id: int, asin: str) -> Optional[Dict[str, Any]]:
-    """Return single active item for a user by ASIN"""
+def get_item_by_user_and_asin(user_id: int, asin: str, domain: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Return single active item for a user by ASIN (and domain if provided)"""
     if not asin:
         return None
     with get_db_connection() as conn:
-        row = conn.execute(
-            "SELECT * FROM items WHERE user_id = ? AND asin = ? AND is_active = 1 LIMIT 1",
-            (user_id, asin)
-        ).fetchone()
+        if domain:
+            row = conn.execute(
+                "SELECT * FROM items WHERE user_id = ? AND asin = ? AND domain = ? AND is_active = 1 LIMIT 1",
+                (user_id, asin, domain)
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT * FROM items WHERE user_id = ? AND asin = ? AND is_active = 1 LIMIT 1",
+                (user_id, asin)
+            ).fetchone()
         return dict(row) if row else None
 
 def update_price(item_id: int, new_price: Optional[float], new_currency: str = None, new_title: str = None, availability: str = 'in_stock') -> None:
@@ -402,6 +410,17 @@ def update_price_bounds(item_id: int, new_min: float, new_max: float) -> None:
             WHERE id = ?
         """, (new_min, new_max, item_id))
         conn.commit()
+
+def update_item_domain(item_id: int, domain: str) -> None:
+    """Persist domain for an existing item if not already set."""
+    if not domain:
+        return
+    with get_db_connection() as conn:
+        try:
+            conn.execute("UPDATE items SET domain = ? WHERE id = ? AND (domain IS NULL OR domain = '')", (domain, item_id))
+            conn.commit()
+        except Exception as e:
+            logger.warning("Failed to update item domain", item_id=item_id, domain=domain, error=str(e))
 
 def get_user_stats(user_id: int) -> Optional[Dict[str, Any]]:
     """Get user statistics"""

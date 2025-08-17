@@ -12,10 +12,29 @@ except ImportError:  # fallback when run directly
     from logger import logger
     from resilience import retry_with_backoff, circuit_breakers
 
-HEADERS = {
-    "User-Agent": config.user_agent,
-    "Accept-Language": "en-US,en;q=0.9",
+BASE_LANG_PREF = "en-US,en;q=0.9"
+DOMAIN_LANG_MAP = {
+    'amazon.it': 'it-IT,it;q=0.9',
+    'amazon.fr': 'fr-FR,fr;q=0.9',
+    'amazon.de': 'de-DE,de;q=0.9',
+    'amazon.es': 'es-ES,es;q=0.9',
+    'amazon.co.uk': 'en-GB,en;q=0.9',
+    'amazon.com': 'en-US,en;q=0.9',
+    'amazon.ca': 'en-CA,en;q=0.9',
+    'amazon.com.mx': 'es-MX,es;q=0.9',
+    'amazon.co.jp': 'ja-JP,ja;q=0.9',
 }
+
+def _build_headers(url: str) -> dict:
+    import re as _re
+    m = _re.match(r'https?://([^/]+)/', url)
+    host = m.group(1).lower() if m else ''
+    host = host.replace('www.', '')
+    lang = DOMAIN_LANG_MAP.get(host, BASE_LANG_PREF)
+    return {
+        "User-Agent": config.user_agent,
+        "Accept-Language": f"{lang},{BASE_LANG_PREF}",
+    }
 
 # In-memory cache for current prices scraped from Amazon (per ASIN)
 _CURRENT_PRICE_CACHE: Dict[str, Dict[str, Any]] = {}
@@ -50,9 +69,9 @@ async def fetch_html(client: httpx.AsyncClient, url: str) -> Optional[str]:
         if circuit_breakers['amazon_scraping'].state == 'open':
             logger.warning("Circuit breaker open for Amazon scraping")
             return None
-            
-        resp = await client.get(url, headers=HEADERS, timeout=config.request_timeout_seconds)
-        
+        headers = _build_headers(url)
+        resp = await client.get(url, headers=headers, timeout=config.request_timeout_seconds)
+
         if resp.status_code == 200:
             # Record success via internal method
             circuit_breakers['amazon_scraping']._on_success()
@@ -94,6 +113,15 @@ def extract_title_and_price(html: str):
 
     price = None
     currency = None
+    if not price_text:
+        # Attempt to build from whole + fraction parts (common in some locales)
+        whole = soup.select_one('span.a-price-whole')
+        frac = soup.select_one('span.a-price-fraction')
+        if whole and whole.get_text(strip=True):
+            combined = whole.get_text(strip=True)
+            if frac and frac.get_text(strip=True):
+                combined += "." + frac.get_text(strip=True)
+            price_text = combined
     if price_text:
         price, currency = parse_price_text(price_text)
 

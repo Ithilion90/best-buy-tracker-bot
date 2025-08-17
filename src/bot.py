@@ -59,19 +59,29 @@ async def ensure_user_in_db(update: Update) -> None:
     if user:
         db.ensure_user(user.id, user.username, user.first_name, user.last_name)
 
-async def send_price_notification(user_id: int, asin: str, title: str, old_price: float, new_price: float, min_price: float, app: Application) -> None:
-    """Send price notification to user"""
+def extract_domain(url: str) -> Optional[str]:
     try:
-        aff_url = with_affiliate(f"https://amazon.it/dp/{asin}")
+        m = re.search(r'https?://([^/]+)/', url + '/')
+        if m:
+            host = m.group(1).lower()
+            # Only keep amazon.* hosts
+            if 'amazon.' in host or host.startswith('amzn.'):
+                return host.replace('www.', '')
+        return None
+    except Exception:
+        return None
+
+async def send_price_notification(user_id: int, asin: str, title: str, old_price: float, new_price: float, min_price: float, app: Application, domain: str | None = None) -> None:
+    """Send price notification to user (domain-aware)."""
+    try:
+        dom = domain or 'amazon.it'
+        aff_url = with_affiliate(f"https://{dom}/dp/{asin}")
         title_display = truncate(title, 40)
         clickable_title = f"<a href=\"{aff_url}\">{title_display}</a>"
-        
-        # Check if it's a historical minimum
-        is_historical_min = abs(new_price - min_price) < 0.01
-        
+
+        is_historical_min = abs(new_price - min_price) < 0.01 if min_price is not None else False
         hist_line = f"🏷️ <b>Historical Min:</b> €{min_price:.2f}" if min_price is not None else ""
         if is_historical_min:
-            # Historical minimum notification (include explicit min line)
             message = (
                 f"🔥 <b>HISTORICAL MINIMUM!</b> 🔥\n\n"
                 f"📦 {clickable_title}\n\n"
@@ -82,7 +92,6 @@ async def send_price_notification(user_id: int, asin: str, title: str, old_price
                 f"🎯 <b>This is the lowest price ever recorded!</b>"
             )
         else:
-            # Regular price drop notification (append historical min line)
             message = (
                 f"📉 <b>Price Drop Alert!</b>\n\n"
                 f"📦 {clickable_title}\n\n"
@@ -91,16 +100,9 @@ async def send_price_notification(user_id: int, asin: str, title: str, old_price
                 f"💡 <b>Savings:</b> €{old_price - new_price:.2f}\n"
                 f"{hist_line}"
             )
-        
-        await app.bot.send_message(
-            chat_id=user_id,
-            text=message,
-            parse_mode="HTML",
-            disable_web_page_preview=True
-        )
-        
-        logger.info("Price notification sent", user_id=user_id, asin=asin, old_price=old_price, new_price=new_price, is_historical_min=is_historical_min)
-        
+
+        await app.bot.send_message(chat_id=user_id, text=message, parse_mode="HTML", disable_web_page_preview=True)
+        logger.info("Price notification sent", user_id=user_id, asin=asin, domain=dom, old_price=old_price, new_price=new_price, is_historical_min=is_historical_min)
     except Exception as e:
         logger.error("Error sending notification", error=str(e), user_id=user_id, asin=asin)
 
@@ -155,7 +157,15 @@ async def refresh_cache_and_notify(app: Application) -> None:
                 if isinstance(old_price, (int, float)):
                     drop = old_price - current_price
                     if drop > 1.0 or (old_price > 0 and drop / old_price > 0.05):
-                        await send_price_notification(item['user_id'], asin, item['title'] or (scraped_title or f"Product {asin}"), old_price, current_price, adj_min, app)
+                        # Derive domain for notification
+                        item_domain = item.get('domain') or extract_domain(item.get('url') or '')
+                        # Optionally persist domain if missing
+                        if item_domain and not item.get('domain'):
+                            try:
+                                db.update_item_domain(item['id'], item_domain)
+                            except Exception:
+                                pass
+                        await send_price_notification(item['user_id'], asin, item['title'] or (scraped_title or f"Product {asin}"), old_price, current_price, adj_min, app, domain=item_domain)
                 try:
                     db.update_price_bounds(item['id'], adj_min, adj_max)
                     db.update_price(item['id'], current_price)
@@ -173,8 +183,8 @@ async def refresh_cache_and_notify(app: Application) -> None:
 async def periodic_price_check(app: Application) -> None:
     while True:
         await refresh_cache_and_notify(app)
-    # Sleep for 30 minutes between refresh cycles (1800 seconds)
-    await asyncio.sleep(1800)
+        # Sleep for 30 minutes between refresh cycles (1800 seconds)
+        await asyncio.sleep(1800)
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Start command - automatically shows help"""
@@ -196,6 +206,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 async def handle_shared_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = await update.message.reply_text("🔍 Reading...")
     """Handle shared Amazon links - MAIN FUNCTIONALITY"""
     await ensure_user_in_db(update)
     user = update.effective_user
@@ -230,34 +241,46 @@ async def handle_shared_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if not asin:
             await msg.edit_text("❌ Cannot extract ASIN from this link")
             return
+        domain = extract_domain(url)
 
         # Check if product already tracked by this user
         try:
-            existing = db.get_item_by_user_and_asin(user.id, asin)
+            existing = db.get_item_by_user_and_asin(user.id, asin, domain)
         except Exception:
             existing = None
         if existing:
-            # Fetch latest Keepa (maybe cached) to show up-to-date data
-            keepa_existing = fetch_lifetime_min_max_current([asin]) or {}
-            k_min, k_max, k_current = keepa_existing.get(asin, (existing.get('min_price'), existing.get('max_price'), existing.get('last_price')))
-            current_display = k_current or existing.get('last_price') or existing.get('min_price') or 0
+            # Use cache first (domain-aware) to avoid re-querying external API
+            existing_domain = existing.get('domain') or extract_domain(existing.get('url') or '')
+            cached_bounds = keepa_cache.get_lifetime_minmax_current([asin], domain=existing_domain) or {}
+            k_min, k_max, k_cur = cached_bounds.get(asin, (None, None, None))
+            if not (k_min and k_max and k_cur):
+                # Fallback to product info cache (single asin) if aggregated domain cache missing
+                pinfo = keepa_cache.get_product_info(asin)
+                if pinfo and (not existing_domain or pinfo.get('domain') == existing_domain):
+                    k_min = k_min or pinfo.get('adj_min') or pinfo.get('min')
+                    k_max = k_max or pinfo.get('adj_max') or pinfo.get('max')
+                    k_cur = k_cur or pinfo.get('current')
+            # Final fallbacks to DB record to ensure we always show something
+            current_display = k_cur or existing.get('last_price') or existing.get('min_price') or 0
             min_display = k_min or existing.get('min_price') or current_display
             max_display = k_max or existing.get('max_price') or current_display
             title_display_full = existing.get('title') or f"Amazon Product {asin}"
             aff_url_existing = with_affiliate(existing.get('url'))
             title_display = truncate(title_display_full, 60)
             clickable_title_existing = f"<a href=\"{aff_url_existing}\">{title_display}</a>"
+            domain_disp = existing_domain or 'n/a'
             await msg.edit_text(
-                "ℹ️ <b>Already Tracked</b>\n\n"
-                f"📦 {clickable_title_existing}\n"
-                f"💰 <b>Current Price:</b> €{current_display:.2f}\n"
-                f"📉 <b>Min Price:</b> €{min_display:.2f}\n"
-                f"📈 <b>Max Price:</b> €{max_display:.2f}\n\n"
-                "Use /list to view all your products.",
+                "📦 <b>Product Already Tracked</b>\n\n"
+                f"{clickable_title_existing}\n"
+                f"🌍 <b>Domain:</b> {domain_disp}\n"
+                f"💰 <b>Current:</b> €{current_display:.2f}\n"
+                f"📉 <b>Min:</b> €{min_display:.2f}\n"
+                f"📈 <b>Max:</b> €{max_display:.2f}\n\n"
+                "Use /list to view all products.",
                 parse_mode="HTML",
                 disable_web_page_preview=True
             )
-            logger.info("Duplicate add prevented", asin=asin, user_id=user.id)
+            logger.info("Duplicate link relayed from cache (data shown)", asin=asin, user_id=user.id, domain=existing_domain)
             return
 
         # Get product title and current price (use resolved URL)
@@ -289,6 +312,7 @@ async def handle_shared_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
             user_id=user.id,
             url=url,
             asin=asin,
+            domain=domain,
             title=title,
             currency=currency or "EUR",
             price=current_price
@@ -305,7 +329,6 @@ async def handle_shared_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
         aff_url = with_affiliate(url)
         title_display = truncate(title, 60)
         clickable_title = f"<a href=\"{aff_url}\">{title_display}</a>"
-        
         response = (
             f"✅ <b>Product Added!</b>\n\n"
             f"📦 {clickable_title}\n"
@@ -314,11 +337,9 @@ async def handle_shared_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
             f"📈 <b>Max Price:</b> €{corrected_max:.2f}\n\n"
             f"📢 <b>You'll be notified when the price change!</b>"
         )
-        
         # Cache the exact values shown to the user BEFORE sending response to guarantee consistency with /list
         try:
-            keepa_cache.set_lifetime_minmax_current([asin], {asin: (corrected_min, corrected_max, current_price)})
-            # Also store detailed product info for fallback lookups
+            keepa_cache.set_lifetime_minmax_current([asin], {asin: (corrected_min, corrected_max, current_price)}, domain=domain)
             keepa_cache.set_product_info(asin, {
                 "asin": asin,
                 "current": current_price,
@@ -326,13 +347,14 @@ async def handle_shared_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 "max": corrected_max,
                 "adj_min": corrected_min,
                 "adj_max": corrected_max,
+                "domain": domain,
                 "source": "initial_add",
                 "ts": time.time()
             })
         except Exception as e:
-            logger.warning("Failed to update keepa cache on add", asin=asin, ehandle_shared_linkrror=str(e))
+            logger.warning("Failed to update keepa cache on add", asin=asin, error=str(e))
         await msg.edit_text(response, parse_mode="HTML", disable_web_page_preview=True)
-        logger.info("Product added via shared link", asin=asin, title=title[:30], current_price=current_price, min_price=corrected_min, max_price=corrected_max)
+        logger.info("Product added via shared link", asin=asin, domain=domain, title=title[:30], current_price=current_price, min_price=corrected_min, max_price=corrected_max)
         
     except Exception as e:
         logger.error("Error processing shared link", error=str(e))
@@ -355,24 +377,32 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = await update.message.reply_text("🔍 Fetching cached data...")
     
     try:
-        # Use cache only
-        asins = [r['asin'] for r in rows if r.get('asin')]
-        if not asins:
-            await msg.edit_text("❌ No valid ASINs found in tracked products")
-            return
-        cached = keepa_cache.get_lifetime_minmax_current(asins)
+        # Build per-domain ASIN grouping to fetch domain-specific cache entries
+        domain_groups: dict[str | None, list[str]] = {}
+        for r in rows:
+            asin = r.get('asin')
+            if not asin:
+                continue
+            dom = r.get('domain') or extract_domain(r.get('url') or '')
+            domain_groups.setdefault(dom, []).append(asin)
+        # Fetch cache per domain
+        domain_cache: dict[str | None, dict] = {}
+        for dom, asin_list in domain_groups.items():
+            cached_dom = keepa_cache.get_lifetime_minmax_current(asin_list, domain=dom) or {}
+            domain_cache[dom] = cached_dom
         lines = ["🛒 <b>Your Tracked Products:</b>\n"]
         for i, r in enumerate(rows, 1):
             asin = r.get('asin')
             if not asin:
                 continue
-            triple = cached.get(asin) if cached and isinstance(cached, dict) else None
+            dom = r.get('domain') or extract_domain(r.get('url') or '')
+            triple = domain_cache.get(dom, {}).get(asin)
             min_p = max_p = cur_p = None
             if triple and isinstance(triple, (list, tuple)) and len(triple) == 3:
                 min_p, max_p, cur_p = triple
             if not (min_p and max_p and cur_p):
                 prod_info = keepa_cache.get_product_info(asin)
-                if prod_info:
+                if prod_info and (not dom or prod_info.get('domain') == dom):
                     cur_p = cur_p or prod_info.get('current')
                     min_p = min_p or prod_info.get('adj_min') or prod_info.get('min')
                     max_p = max_p or prod_info.get('adj_max') or prod_info.get('max')
@@ -389,6 +419,7 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             aff_url = with_affiliate(r['url'])
             clickable = f"<a href=\"{aff_url}\">{title_disp}</a>"
             line = f"{i}. {clickable}\n"
+            line += f"   🌍 <b>Domain:</b> {dom or 'n/a'}\n"
             line += f"   💰 <b>Current:</b> €{cur_p:.2f}\n"
             line += f"   📉 <b>Min:</b> €{min_p:.2f}\n"
             line += f"   📈 <b>Max:</b> €{max_p:.2f}"

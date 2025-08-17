@@ -100,24 +100,30 @@ class KeepaCache:
     def __init__(self, cache_dir: str = "cache/keepa"):
         self.cache = DiskCache(cache_dir, default_ttl=1800)  # 30 minutes default
     
-    def get_lifetime_minmax(self, asins: List[str]) -> Optional[Dict[str, Tuple[Optional[float], Optional[float]]]]:
-        """Get cached lifetime min/max for list of ASINs"""
-        cache_key = f"minmax:{':'.join(sorted(asins))}"
+    def _compose_key(self, prefix: str, asins: List[str], domain: Optional[str] = None) -> str:
+        base = f"{prefix}:{':'.join(sorted(asins))}"
+        if domain:
+            return f"{prefix}:{domain}:{':'.join(sorted(asins))}"
+        return base
+
+    def get_lifetime_minmax(self, asins: List[str], domain: Optional[str] = None) -> Optional[Dict[str, Tuple[Optional[float], Optional[float]]]]:
+        """Get cached lifetime min/max for list of ASINs (optionally domain-specific)."""
+        cache_key = self._compose_key("minmax", asins, domain)
         return self.cache.get(cache_key)
     
-    def set_lifetime_minmax(self, asins: List[str], data: Dict[str, Tuple[Optional[float], Optional[float]]], ttl: float = 1800) -> None:
-        """Cache lifetime min/max for list of ASINs"""
-        cache_key = f"minmax:{':'.join(sorted(asins))}"
+    def set_lifetime_minmax(self, asins: List[str], data: Dict[str, Tuple[Optional[float], Optional[float]]], ttl: float = 1800, domain: Optional[str] = None) -> None:
+        """Cache lifetime min/max for list of ASINs (optionally domain-specific)."""
+        cache_key = self._compose_key("minmax", asins, domain)
         self.cache.set(cache_key, data, ttl)
     
-    def get_lifetime_minmax_current(self, asins: List[str]) -> Optional[Dict[str, Tuple[Optional[float], Optional[float], Optional[float]]]]:
-        """Get cached lifetime min/max/current for list of ASINs"""
-        cache_key = f"minmax_current:{':'.join(sorted(asins))}"
+    def get_lifetime_minmax_current(self, asins: List[str], domain: Optional[str] = None) -> Optional[Dict[str, Tuple[Optional[float], Optional[float], Optional[float]]]]:
+        """Get cached lifetime min/max/current for list of ASINs (optionally domain-specific)."""
+        cache_key = self._compose_key("minmax_current", asins, domain)
         return self.cache.get(cache_key)
     
-    def set_lifetime_minmax_current(self, asins: List[str], data: Dict[str, Tuple[Optional[float], Optional[float], Optional[float]]], ttl: float = 1800) -> None:
-        """Cache lifetime min/max/current for list of ASINs"""
-        cache_key = f"minmax_current:{':'.join(sorted(asins))}"
+    def set_lifetime_minmax_current(self, asins: List[str], data: Dict[str, Tuple[Optional[float], Optional[float], Optional[float]]], ttl: float = 1800, domain: Optional[str] = None) -> None:
+        """Cache lifetime min/max/current for list of ASINs (optionally domain-specific)."""
+        cache_key = self._compose_key("minmax_current", asins, domain)
         self.cache.set(cache_key, data, ttl)
     
     def get_product_info(self, asin: str) -> Optional[Dict[str, Any]]:
@@ -126,7 +132,7 @@ class KeepaCache:
         return self.cache.get(cache_key)
     
     def set_product_info(self, asin: str, data: Dict[str, Any], ttl: float = 3600) -> None:
-        """Cache product info for single ASIN"""
+        """Cache product info for single ASIN including domain if provided."""
         cache_key = f"product:{asin}"
         self.cache.set(cache_key, data, ttl)
 

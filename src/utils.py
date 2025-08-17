@@ -26,22 +26,41 @@ def normalize_amazon_url(url: str) -> str:
     return f"{domain}/dp/{asin}"
 
 def parse_price_text(text: str) -> Tuple[Optional[float], Optional[str]]:
-    text = text.strip()
+    """Parse a localized Amazon price string into (float, currency).
+    Handles formats like:
+      12,34 €  |  €12,34  |  1.234,56 €  |  1 234,56 €  |  $12.34  |  12,34 EUR
+    """
+    raw = text.strip()
     import re as _re
-    mcur = _re.match(r'([£$]|USD|EUR|GBP)?\s*(.*)', text)
+    # Normalize non‑breaking spaces
+    raw = raw.replace('\u202f', ' ').replace('\xa0', ' ')
+    # Extract currency symbol (leading or trailing)
     currency = None
-    number = text
-    if mcur:
-        currency = mcur.group(1)
-        number = mcur.group(2) if mcur.group(2) else number
-    clean = _re.sub(r'[^0-9.,]', '', number)
+    cur_match = _re.search(r'(USD|EUR|GBP|CHF|CAD|AUD|£|€|\$)', raw)
+    if cur_match:
+        sym = cur_match.group(1)
+        # Map symbols to ISO if possible
+        symbol_map = {'£': 'GBP', '€': 'EUR', '$': '$'}
+        currency = symbol_map.get(sym, sym)
+    # Remove currency words/symbols to isolate number
+    number_part = _re.sub(r'(USD|EUR|GBP|CHF|CAD|AUD|£|€|\$)', '', raw, flags=_re.IGNORECASE)
+    # Remove words like TTC, IVA, taxes, etc.
+    number_part = _re.sub(r'(?i)(ttc|iva|tax(es)?|incl\.?|compr\.?|sped\.?|gratuit)', '', number_part)
+    # Remove spaces (thousand separators) but keep separators . or ,
+    number_part = _re.sub(r'\s+', '', number_part)
+    # Keep only digits and separators
+    clean = _re.sub(r'[^0-9.,]', '', number_part)
+    # Heuristic: if both separators present decide decimal
     if clean.count(',') > 0 and clean.count('.') > 0:
+        # Last occurring separator is decimal
         if clean.rfind(',') > clean.rfind('.'):
-            clean = clean.replace('.', '')
-            clean = clean.replace(',', '.')
+            # comma decimal => remove dots (thousands) then replace comma with dot
+            clean = clean.replace('.', '').replace(',', '.')
         else:
+            # dot decimal => remove commas
             clean = clean.replace(',', '')
     else:
+        # Only one type or none
         if clean.count(',') == 1 and len(clean.split(',')[-1]) in (2, 3):
             clean = clean.replace(',', '.')
         else:
