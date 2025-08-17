@@ -200,6 +200,12 @@ async def handle_shared_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
     m = AMAZON_URL_RE.search(text)
     if not m:
+        # If message contains a URL but not an Amazon link, notify user once
+        lowered = text.lower()
+        if ("http://" in lowered or "https://" in lowered or "www." in lowered):
+            await update.message.reply_text(
+                "❌ Link non supportato. Invia un link prodotto Amazon valido (amazon.* o amzn.to)."
+            )
         return
     
     url = m.group(1)
@@ -478,6 +484,11 @@ def main() -> None:
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("remove", cmd_remove))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_shared_link))
+    
+    # Unknown command handler (must be after known commands)
+    async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await update.message.reply_text("❌ Comando non riconosciuto. Usa /help per la lista dei comandi disponibili.")
+    app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
     app.add_error_handler(error_handler)
     
     # Start periodic price checking in a separate task after the app starts
