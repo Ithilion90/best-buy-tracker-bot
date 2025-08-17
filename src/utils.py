@@ -1,6 +1,8 @@
 ﻿import re
 from typing import Optional, Tuple
 from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
+import asyncio
+import httpx
 try:
     from .config import config
 except ImportError:  # fallback when run directly
@@ -65,3 +67,35 @@ def with_affiliate(url: str) -> str:
         return urlunparse((u.scheme, u.netloc, u.path, u.params, new_query, u.fragment))
     except Exception:
         return url
+
+# --- New helpers for Amazon App shared links / short links ---
+SHORT_AMAZON_DOMAINS = {"amzn.to", "amzn.eu", "amzn.in", "amzn.asia"}
+
+def is_short_amazon(url: str) -> bool:
+    try:
+        netloc = urlparse(url).netloc.lower()
+        # Strip leading www.
+        if netloc.startswith("www."):
+            netloc = netloc[4:]
+        return netloc in SHORT_AMAZON_DOMAINS
+    except Exception:
+        return False
+
+async def expand_short_amazon_url(url: str, timeout: int = 10) -> str:
+    """Follow redirects for amzn.* short links to reach canonical /dp/ URL.
+    Returns original url on failure.
+    """
+    if not is_short_amazon(url):
+        return url
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=timeout, headers={"User-Agent": config.user_agent}) as client:
+            resp = await client.get(url)
+            return str(resp.url)
+    except Exception:
+        return url
+
+async def resolve_and_normalize_amazon_url(url: str) -> str:
+    """Expand short (amzn.*) links then normalize to /dp/ASIN form if possible."""
+    expanded = await expand_short_amazon_url(url)
+    return normalize_amazon_url(expanded)
+

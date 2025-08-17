@@ -10,21 +10,24 @@ try:
     from src.config import config, validate_config
     from src.logger import logger
     from src.keepa_client import fetch_lifetime_min_max, fetch_lifetime_min_max_current
-    from src.utils import extract_asin, with_affiliate, truncate
+    from src.utils import extract_asin, with_affiliate, truncate, resolve_and_normalize_amazon_url
     from src.price_fetcher import fetch_price_and_title
 except ImportError:
     import db
     from config import config, validate_config
     from logger import logger
     from keepa_client import fetch_lifetime_min_max, fetch_lifetime_min_max_current
-    from utils import extract_asin, with_affiliate, truncate
+    from utils import extract_asin, with_affiliate, truncate, resolve_and_normalize_amazon_url
     from price_fetcher import fetch_price_and_title
 
-AMAZON_URL_RE = re.compile(r'(https?://(?:www\.)?amazon\.(?:com|co\.uk|de|fr|it|es|ca|co\.jp|in|com\.mx)/[^\s]+)', re.IGNORECASE)
+AMAZON_URL_RE = re.compile(
+    r'(https?://(?:www\.)?(?:amzn\.to|amzn\.eu|amzn\.in|amazon\.(?:com|co\.uk|de|fr|it|es|ca|co\.jp|in|com\.mx))/[^\s]+)',
+    re.IGNORECASE,
+)
 
 def validate_amazon_url(url: str) -> bool:
     """Validate Amazon URL"""
-    supported_domains = ['amazon.com', 'amazon.co.uk', 'amazon.de', 'amazon.fr', 'amazon.it', 'amazon.es', 'amazon.ca', 'amazon.co.jp', 'amazon.in', 'amazon.com.mx']
+    supported_domains = ['amazon.com', 'amazon.co.uk', 'amazon.de', 'amazon.fr', 'amazon.it', 'amazon.es', 'amazon.ca', 'amazon.co.jp', 'amazon.in', 'amazon.com.mx', 'amzn.to', 'amzn.eu', 'amzn.in']
     return any(domain in url.lower() for domain in supported_domains)
 
 def validate_price_consistency(current_price: float, min_price: float, max_price: float) -> tuple[float, float]:
@@ -103,7 +106,7 @@ async def check_price_changes(app: Application) -> None:
     try:
         # Get all tracked items
         all_items = db.get_all_items()
-        if not all_items:
+        if not all_items: 
             return
         
         # Group by ASIN to avoid duplicate Keepa requests
@@ -203,40 +206,48 @@ async def handle_shared_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
     if not validate_amazon_url(url):
         return
+
+    # Expand short link and normalize (/dp/ASIN) form
+    try:
+        url = await resolve_and_normalize_amazon_url(url)
+    except Exception:
+        pass
     
     msg = await update.message.reply_text("🔍 Processing Amazon link...")
     
     try:
-        # Extract ASIN
+        # Extract ASIN (after resolution/normalization)
         asin = extract_asin(url)
         if not asin:
             await msg.edit_text("❌ Cannot extract ASIN from this link")
             return
-        
-        # Get product title and current price
+
+        # Get product title and current price (use resolved URL)
         title, current_price, currency = await fetch_price_and_title(url)
         if not title:
             title = f"Amazon Product {asin}"
-        
+
         if not current_price:
             await msg.edit_text("❌ Cannot fetch current price for this product")
             return
-        
+
         # Get Keepa data
         keepa_data = fetch_lifetime_min_max_current([asin])
-        min_price, max_price, current_price = keepa_data.get(asin, (None, None, None))
-        
+        min_price, max_price, current_price_from_keepa = keepa_data.get(asin, (None, None, None))
+
         if not min_price or not max_price:
             await msg.edit_text("❌ No price data found for this product")
             return
-        
-        # Use current price from Keepa if available, otherwise fallback to average
-        if not current_price:
+
+        # Use current price from Keepa if available, otherwise fallback to scraped one or average
+        if current_price_from_keepa:
+            current_price = current_price_from_keepa
+        elif not current_price:
             current_price = (min_price + max_price) / 2
-        
+
         # Validate price consistency - adjust min/max if needed but keep current price
         corrected_min, corrected_max = validate_price_consistency(current_price, min_price, max_price)
-        
+
         # Add to database with current price and corrected min/max
         item_id = db.add_item(
             user_id=user.id,
@@ -246,7 +257,7 @@ async def handle_shared_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
             currency=currency or "EUR",
             price=current_price  # Use actual current price
         )
-        
+
         # Create affiliate link for display
         aff_url = with_affiliate(url)
         title_display = truncate(title, 60)
