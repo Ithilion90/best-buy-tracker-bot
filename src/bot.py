@@ -244,6 +244,35 @@ async def handle_shared_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await msg.edit_text("❌ Cannot extract ASIN from this link")
             return
 
+        # Check if product already tracked by this user
+        try:
+            existing = db.get_item_by_user_and_asin(user.id, asin)
+        except Exception:
+            existing = None
+        if existing:
+            # Fetch latest Keepa (maybe cached) to show up-to-date data
+            keepa_existing = fetch_lifetime_min_max_current([asin]) or {}
+            k_min, k_max, k_current = keepa_existing.get(asin, (existing.get('min_price'), existing.get('max_price'), existing.get('last_price')))
+            current_display = k_current or existing.get('last_price') or existing.get('min_price') or 0
+            min_display = k_min or existing.get('min_price') or current_display
+            max_display = k_max or existing.get('max_price') or current_display
+            title_display_full = existing.get('title') or f"Amazon Product {asin}"
+            aff_url_existing = with_affiliate(existing.get('url'))
+            title_display = truncate(title_display_full, 60)
+            clickable_title_existing = f"<a href=\"{aff_url_existing}\">{title_display}</a>"
+            await msg.edit_text(
+                "ℹ️ <b>Already Tracked</b>\n\n"
+                f"📦 {clickable_title_existing}\n"
+                f"💰 <b>Current Price:</b> €{current_display:.2f}\n"
+                f"📉 <b>Min Price:</b> €{min_display:.2f}\n"
+                f"📈 <b>Max Price:</b> €{max_display:.2f}\n\n"
+                "Use /list to view all your products.",
+                parse_mode="HTML",
+                disable_web_page_preview=True
+            )
+            logger.info("Duplicate add prevented", asin=asin, user_id=user.id)
+            return
+
         # Get product title and current price (use resolved URL)
         title, current_price, currency = await fetch_price_and_title(url)
         if not title:
@@ -431,6 +460,14 @@ async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         for item in rows:
             if db.remove_item(user.id, item['id']):
                 removed_count += 1
+                asin_for_cache = item.get('asin')
+                if asin_for_cache:
+                    try:
+                        # Remove possible single-ASIN cache variants
+                        keepa_cache.cache.delete(f"minmax_current:{asin_for_cache}")
+                        keepa_cache.cache.delete(f"product:{asin_for_cache}")
+                    except Exception:
+                        pass
         
         if removed_count > 0:
             await update.message.reply_text(
@@ -478,6 +515,13 @@ async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             parse_mode="HTML"
         )
         logger.info("Removed single product", user_id=user.id, item_id=item['id'], title=title)
+        asin_for_cache = item.get('asin')
+        if asin_for_cache:
+            try:
+                keepa_cache.cache.delete(f"minmax_current:{asin_for_cache}")
+                keepa_cache.cache.delete(f"product:{asin_for_cache}")
+            except Exception:
+                pass
     else:
         await update.message.reply_text(
             "❌ Error removing product. Please try again.",

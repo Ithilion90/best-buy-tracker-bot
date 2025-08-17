@@ -262,6 +262,17 @@ def list_items(user_id: int, include_inactive: bool = False) -> List[Dict[str, A
         
         return [dict(row) for row in rows]
 
+def get_item_by_user_and_asin(user_id: int, asin: str) -> Optional[Dict[str, Any]]:
+    """Return single active item for a user by ASIN"""
+    if not asin:
+        return None
+    with get_db_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM items WHERE user_id = ? AND asin = ? AND is_active = 1 LIMIT 1",
+            (user_id, asin)
+        ).fetchone()
+        return dict(row) if row else None
+
 def update_price(item_id: int, new_price: Optional[float], new_currency: str = None, new_title: str = None, availability: str = 'in_stock') -> None:
     """Update item price with enhanced tracking"""
     with get_db_connection() as conn:
