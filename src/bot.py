@@ -1,4 +1,5 @@
 ﻿from typing import Optional
+import time
 import re
 import asyncio
 from telegram import Update
@@ -282,15 +283,22 @@ async def handle_shared_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
         # Validate price consistency - adjust min/max if needed but keep current price
         corrected_min, corrected_max = validate_price_consistency(current_price, min_price, max_price)
 
-        # Add to database with current price and corrected min/max
+        # Add to database with current price (DB insert sets min/max equal to current)
         item_id = db.add_item(
             user_id=user.id,
             url=url,
             asin=asin,
             title=title,
             currency=currency or "EUR",
-            price=current_price  # Use actual current price
+            price=current_price
         )
+        # Immediately correct stored min/max in DB to the historical bounds we just displayed
+        try:
+            if (corrected_min is not None and corrected_max is not None and
+                (corrected_min != current_price or corrected_max != current_price)):
+                db.update_price_bounds(item_id, corrected_min, corrected_max)
+        except Exception as e:
+            logger.warning("Failed to update initial DB bounds", asin=asin, error=str(e))
 
         # Create affiliate link for display
         aff_url = with_affiliate(url)
@@ -306,12 +314,24 @@ async def handle_shared_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
             f"📢 <b>You'll be notified when the price change!</b>"
         )
         
-        await msg.edit_text(response, parse_mode="HTML", disable_web_page_preview=True)
-        logger.info("Product added via shared link", asin=asin, title=title[:30], current_price=current_price, min_price=corrected_min, max_price=corrected_max)
+        # Cache the exact values shown to the user BEFORE sending response to guarantee consistency with /list
         try:
             keepa_cache.set_lifetime_minmax_current([asin], {asin: (corrected_min, corrected_max, current_price)})
+            # Also store detailed product info for fallback lookups
+            keepa_cache.set_product_info(asin, {
+                "asin": asin,
+                "current": current_price,
+                "min": corrected_min,
+                "max": corrected_max,
+                "adj_min": corrected_min,
+                "adj_max": corrected_max,
+                "source": "initial_add",
+                "ts": time.time()
+            })
         except Exception as e:
             logger.warning("Failed to update keepa cache on add", asin=asin, error=str(e))
+        await msg.edit_text(response, parse_mode="HTML", disable_web_page_preview=True)
+        logger.info("Product added via shared link", asin=asin, title=title[:30], current_price=current_price, min_price=corrected_min, max_price=corrected_max)
         
     except Exception as e:
         logger.error("Error processing shared link", error=str(e))
