@@ -204,7 +204,7 @@ async def handle_shared_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
         lowered = text.lower()
         if ("http://" in lowered or "https://" in lowered or "www." in lowered):
             await update.message.reply_text(
-                "❌ Link non supportato. Invia un link prodotto Amazon valido (amazon.* o amzn.to)."
+                "❌ Unsupported link. Please send a valid Amazon product link (amazon.* or amzn.to)."
             )
         return
     
@@ -487,7 +487,7 @@ def main() -> None:
     
     # Unknown command handler (must be after known commands)
     async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        await update.message.reply_text("❌ Comando non riconosciuto. Usa /help per la lista dei comandi disponibili.")
+        await update.message.reply_text("❌ Unknown command. Use /help to see the available commands.")
     app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
     app.add_error_handler(error_handler)
     
