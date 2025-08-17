@@ -12,6 +12,7 @@ try:
     from src.keepa_client import fetch_lifetime_min_max, fetch_lifetime_min_max_current
     from src.utils import extract_asin, with_affiliate, truncate, resolve_and_normalize_amazon_url
     from src.price_fetcher import fetch_price_and_title
+    from src.cache import keepa_cache  # added
 except ImportError:
     import db
     from config import config, validate_config
@@ -19,6 +20,7 @@ except ImportError:
     from keepa_client import fetch_lifetime_min_max, fetch_lifetime_min_max_current
     from utils import extract_asin, with_affiliate, truncate, resolve_and_normalize_amazon_url
     from price_fetcher import fetch_price_and_title
+    from cache import keepa_cache  # added
 
 AMAZON_URL_RE = re.compile(
     r'(https?://(?:www\.)?(?:amzn\.to|amzn\.eu|amzn\.in|amazon\.(?:com|co\.uk|de|fr|it|es|ca|co\.jp|in|com\.mx))/[^\s]+)',
@@ -108,62 +110,76 @@ async def check_price_changes(app: Application) -> None:
         all_items = db.get_all_items()
         if not all_items: 
             return
-        
-        # Group by ASIN to avoid duplicate Keepa requests
+        # Grouping logic remains
         asin_to_items = {}
         for item in all_items:
             asin = item.get('asin')
             if asin:
-                if asin not in asin_to_items:
-                    asin_to_items[asin] = []
-                asin_to_items[asin].append(item)
-        
+                asin_to_items.setdefault(asin, []).append(item)
         if not asin_to_items:
             return
-        
-        # Fetch current prices from Keepa
         asins = list(asin_to_items.keys())
         keepa_data = fetch_lifetime_min_max_current(asins)
-        
+        # Scrape tasks
+        scrape_tasks = {}
         for asin, items in asin_to_items.items():
-            if asin not in keepa_data:
+            sample_url = items[0].get('url')
+            if sample_url:
+                scrape_tasks[asin] = asyncio.create_task(fetch_price_and_title(sample_url))
+        scrape_results = {}
+        if scrape_tasks:
+            for asin, task in scrape_tasks.items():
+                try:
+                    title_s, scraped_price, _currency = await task
+                    scrape_results[asin] = (title_s, scraped_price)
+                except Exception as e:
+                    logger.warning("Scrape failed", asin=asin, error=str(e))
+        cache_updates = {}  # new
+        for asin, items in asin_to_items.items():
+            keepa_entry = keepa_data.get(asin)
+            if not keepa_entry:
                 continue
-            
-            min_price, max_price, current_price = keepa_data[asin]
+            min_price, max_price, keepa_current = keepa_entry
             if not min_price or not max_price:
                 continue
-            
-            # Use current price from Keepa if available, otherwise fallback to average
-            if not current_price:
-                current_price = (min_price + max_price) / 2
-                logger.info("Using calculated average price as current price", asin=asin, avg_price=current_price)
+            scraped_title, scraped_price = scrape_results.get(asin, (None, None))
+            if scraped_price:
+                current_price = scraped_price
+                source = "scrape"
+            elif keepa_current:
+                current_price = keepa_current
+                source = "keepa"
             else:
-                logger.info("Using Keepa current price", asin=asin, current_price=current_price)
-            
+                current_price = (min_price + max_price) / 2
+                source = "avg"
+            logger.info("Resolved current price", asin=asin, source=source, current=current_price)
+            adj_min, adj_max = validate_price_consistency(current_price, min_price, max_price)
+            cache_updates[asin] = (min_price, max_price, current_price)  # record authoritative current
             for item in items:
                 old_price = item.get('last_price')
-                if not old_price:
+                if not isinstance(old_price, (int, float)):
                     continue
-                
-                # Check if price dropped significantly (more than 1 euro or 5%)
                 price_drop = old_price - current_price
                 if price_drop > 1.0 or (price_drop / old_price) > 0.05:
-                    # Send notification
                     await send_price_notification(
                         user_id=item['user_id'],
                         asin=asin,
-                        title=item['title'],
+                        title=item['title'] or (scraped_title or f"Product {asin}"),
                         old_price=old_price,
                         new_price=current_price,
-                        min_price=min_price,
+                        min_price=adj_min,
                         app=app
                     )
-                    
-                    # Update price in database
-                    db.update_item_price(item['id'], current_price)
-        
-        logger.info("Price check completed", items_checked=len(all_items), asins_checked=len(asins))
-        
+                    try:
+                        db.update_price(item['id'], current_price)
+                    except Exception as e:
+                        logger.warning("DB update failed", item_id=item['id'], error=str(e))
+        if cache_updates:
+            try:
+                keepa_cache.set_lifetime_minmax_current(list(cache_updates.keys()), cache_updates)
+            except Exception as e:
+                logger.warning("Failed to update keepa cache after price check", error=str(e))
+        logger.info("Price check completed", items_checked=len(all_items), asins_checked=len(asins), cache_updates=len(cache_updates))
     except Exception as e:
         logger.error("Error in price check", error=str(e))
 
@@ -245,11 +261,9 @@ async def handle_shared_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await msg.edit_text("❌ No price data found for this product")
             return
 
-        # Use current price from Keepa if available, otherwise fallback to scraped one or average
-        if current_price_from_keepa:
+        # Use current price if available, otherwise fallback to current_price_from_keepa 
+        if not current_price:
             current_price = current_price_from_keepa
-        elif not current_price:
-            current_price = (min_price + max_price) / 2
 
         # Validate price consistency - adjust min/max if needed but keep current price
         corrected_min, corrected_max = validate_price_consistency(current_price, min_price, max_price)
@@ -280,6 +294,10 @@ async def handle_shared_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
         
         await msg.edit_text(response, parse_mode="HTML", disable_web_page_preview=True)
         logger.info("Product added via shared link", asin=asin, title=title[:30], current_price=current_price, min_price=corrected_min, max_price=corrected_max)
+        try:
+            keepa_cache.set_lifetime_minmax_current([asin], {asin: (corrected_min, corrected_max, current_price)})
+        except Exception as e:
+            logger.warning("Failed to update keepa cache on add", asin=asin, error=str(e))
         
     except Exception as e:
         logger.error("Error processing shared link", error=str(e))
