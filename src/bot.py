@@ -42,6 +42,7 @@ AMAZON_URL_RE = re.compile(
     re.IGNORECASE,
 )
 
+
 def validate_amazon_url(url: str) -> bool:
     """Validate Amazon URL"""
     supported_domains = ['amazon.com', 'amazon.co.uk', 'amazon.de', 'amazon.fr', 'amazon.it', 'amazon.es', 'amazon.ca', 'amazon.co.jp', 'amazon.in', 'amazon.com.mx', 'amzn.to', 'amzn.eu', 'amzn.in', 'a.co', 'amzn.asia']
@@ -380,8 +381,7 @@ async def handle_shared_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 f"🌍 <b>Domain:</b> {domain_disp}\n"
                 f"💰 <b>Current:</b> {format_price(current_display, curr)}\n"
                 f"📉 <b>Min:</b> {format_price(min_display, curr)}\n"
-                f"📈 <b>Max:</b> {format_price(max_display, curr)}\n"
-                f"🔗 <b>Affiliate Link:</b> <a href=\"{aff_url_existing}\">{aff_url_existing}</a>\n\n"
+                f"📈 <b>Max:</b> {format_price(max_display, curr)}\n\n"
                 "Use /list to view all products.",
                 parse_mode="HTML",
                 disable_web_page_preview=True
@@ -389,7 +389,7 @@ async def handle_shared_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
             logger.info("Duplicate link relayed from cache (data shown)", asin=asin, user_id=user.id, domain=existing_domain)
             return
 
-        # Get product title, current price and image (use resolved URL)
+        # Get product title, current price and image (use resolved URL) - sequential original flow
         title, current_price, currency, image_url = await fetch_price_title_image(url)
         if not title:
             title = f"Amazon Product {asin}"
