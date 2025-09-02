@@ -322,6 +322,22 @@ def _parse_keepa_products_with_current(products: List[dict]) -> Dict[str, Tuple[
         )
         if need_history:
             hmin, hmax = _minmax_from_history(p)
+            # Extra diagnostics when history requested
+            try:
+                csv0 = p.get('csv')[0] if isinstance(p.get('csv'), (list, tuple)) and p.get('csv') else None
+                sample_values = []
+                if isinstance(csv0, (list, tuple)):
+                    # Extract first 20 price entries (odd indices if alternating)
+                    extracted = []
+                    for idx, v in enumerate(csv0):
+                        if len(extracted) >= 20:
+                            break
+                        if idx % 2 == 1 and isinstance(v, (int, float)) and v > 0:
+                            extracted.append(v)
+                    sample_values = extracted
+                logger.debug("Keepa history diagnostic", asin=asin, history_min=hmin, history_max=hmax, sample_len=len(sample_values), sample=sample_values[:10])
+            except Exception:
+                pass
             updated = False
             if (not isinstance(raw_min, (int, float)) or raw_min <= 0 or (raw_min == raw_current and hmin and hmin < raw_min)) and hmin:
                 raw_min = hmin
@@ -334,6 +350,12 @@ def _parse_keepa_products_with_current(products: List[dict]) -> Dict[str, Tuple[
                     logger.info("History fallback considered", asin=asin, hmin=hmin, hmax=hmax, current=raw_current)
                 except Exception:
                     pass
+            else:
+                if isinstance(raw_current, (int, float)) and raw_min == raw_max == raw_current:
+                    try:
+                        logger.info("History absent or not improving (provisional bounds)", asin=asin, current=raw_current)
+                    except Exception:
+                        pass
 
         min_price = round(raw_min / 100.0, 2) if isinstance(raw_min, (int, float)) and raw_min > 0 else None
         max_price = round(raw_max / 100.0, 2) if isinstance(raw_max, (int, float)) and raw_max > 0 else None
@@ -404,37 +426,108 @@ def _parse_keepa_products(products: List[dict]) -> Dict[str, Tuple[Optional[floa
     return out
 
 def _minmax_from_history(product: dict) -> Tuple[Optional[float], Optional[float]]:
-    """Compute min/max (in cents) from Keepa history arrays when stats are missing.
-    Tries 'data' dict with keys like 'AMAZON'/0, then 'csv' list where index 0 is Amazon.
+    """Compute min/max (in cents) from Keepa history arrays with robust timestamp filtering.
+
+    Heuristics:
+    - Prefer product['data'][AMAZON] style series; fallback to csv[0].
+    - Detect alternating timestamp/value pattern by monotonicity of one subset (timestamps grow).
+    - If ambiguity remains, treat subset with median >> other OR median > 1e6 as timestamps.
+    - Filter unrealistic price cents (> 2,000,000 = 20,000.00) as timestamps/outliers.
+    - If after filtering no prices remain, return (None, None).
     """
-    # Try 'data' mapping first
     data = product.get('data') or {}
     series = None
     if isinstance(data, dict):
         for k in ('AMAZON', 'amazon', 0, '0', 'NEW', 'new', 1, '1'):
-            if k in data and isinstance(data[k], (list, tuple)):
-                series = data[k]
+            seq = data.get(k)
+            if isinstance(seq, (list, tuple)) and len(seq) >= 4:
+                series = seq
                 break
     if series is None:
-        # Fallback to 'csv' array of arrays (0 == Amazon)
         csv = product.get('csv')
-        if isinstance(csv, (list, tuple)) and len(csv) > 0 and isinstance(csv[0], (list, tuple)):
+        if isinstance(csv, (list, tuple)) and len(csv) > 0 and isinstance(csv[0], (list, tuple)) and len(csv[0]) >= 4:
             series = csv[0]
-    if not isinstance(series, (list, tuple)) or len(series) == 0:
+    if not isinstance(series, (list, tuple)) or len(series) < 4:
         return None, None
-    # Keepa series alternate timestamp, value. Extract values at odd indices.
-    values: List[float] = []
-    for idx, v in enumerate(series):
-        if idx % 2 == 1 and isinstance(v, (int, float)) and math.isfinite(v) and v >= 0:
-            values.append(float(v))
-    if not values:
-        # Some shapes may be simple value lists; try all positions
-        for v in series:
-            if isinstance(v, (int, float)) and math.isfinite(v) and v >= 0:
-                values.append(float(v))
-    if not values:
+
+    # Split even/odd indices
+    even_vals = [v for i, v in enumerate(series) if i % 2 == 0 and isinstance(v, (int, float)) and math.isfinite(v)]
+    odd_vals = [v for i, v in enumerate(series) if i % 2 == 1 and isinstance(v, (int, float)) and math.isfinite(v)]
+
+    def monotonic_score(seq: List[float]) -> float:
+        if len(seq) < 3:
+            return 0.0
+        inc = 0
+        total = 0
+        last = seq[0]
+        for v in seq[1:]:
+            if v >= last:
+                inc += 1
+            total += 1
+            last = v
+        return inc / total if total else 0.0
+
+    m_even = monotonic_score(even_vals)
+    m_odd = monotonic_score(odd_vals)
+    median_even = sorted(even_vals)[len(even_vals)//2] if even_vals else 0
+    median_odd = sorted(odd_vals)[len(odd_vals)//2] if odd_vals else 0
+
+    # Decide which subset are timestamps
+    timestamps_are_even = False
+    timestamps_are_odd = False
+    # Primary decision: strong monotonicity difference
+    if m_even >= 0.8 and m_odd < 0.6:
+        timestamps_are_even = True
+    elif m_odd >= 0.8 and m_even < 0.6:
+        timestamps_are_odd = True
+    else:
+        # Secondary: magnitude heuristic (timestamps often >> prices or >1e6)
+        if median_even > 1_000_000 and median_even > median_odd * 2:
+            timestamps_are_even = True
+        elif median_odd > 1_000_000 and median_odd > median_even * 2:
+            timestamps_are_odd = True
+        else:
+            # Fallback: choose subset with larger monotonic score as timestamps
+            if m_even > m_odd:
+                timestamps_are_even = True
+            else:
+                timestamps_are_odd = True
+
+    if timestamps_are_even:
+        price_candidates = odd_vals
+    elif timestamps_are_odd:
+        price_candidates = even_vals
+    else:
+        price_candidates = odd_vals  # default
+
+    # Filter unrealistic price cents (> 2,000,000) and non-positive
+    filtered = [v for v in price_candidates if 0 < v <= 2_000_000]
+    # If nothing left, attempt alternate subset
+    if not filtered:
+        alt = even_vals if price_candidates is odd_vals else odd_vals
+        filtered = [v for v in alt if 0 < v <= 2_000_000]
+    if not filtered:
+        try:
+            logger.debug("History filtering produced no prices", m_even=m_even, m_odd=m_odd, median_even=median_even, median_odd=median_odd)
+        except Exception:
+            pass
         return None, None
-    return (min(values), max(values))
+    # Remove obvious outliers using IQR
+    if len(filtered) >= 5:
+        s = sorted(filtered)
+        q1 = s[len(s)//4]
+        q3 = s[(len(s)*3)//4]
+        iqr = max(q3 - q1, 1)
+        upper = q3 + 3 * iqr
+        lower = max(q1 - 3 * iqr, 0)
+        filtered = [v for v in filtered if lower <= v <= upper]
+        if not filtered:
+            return None, None
+    try:
+        logger.debug("History price extraction", count=len(filtered), m_even=m_even, m_odd=m_odd, timestamps_even=timestamps_are_even, timestamps_odd=timestamps_are_odd)
+    except Exception:
+        pass
+    return (min(filtered), max(filtered))
 
 
 def _fetch_via_http_with_current(asin_list: List[str], api_key: str, domain: Optional[str]) -> Dict[str, Tuple[Optional[float], Optional[float], Optional[float]]]:
