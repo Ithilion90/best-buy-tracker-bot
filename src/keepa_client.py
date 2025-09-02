@@ -272,18 +272,7 @@ def _normalize_products(products_resp) -> List[dict]:
         return [p for p in products_resp if isinstance(p, dict)]
     return []
 
-
-def _extract_prices_from_stat_array(stat_array) -> List[float]:
-    prices: List[float] = []
-    if isinstance(stat_array, (list, tuple)):
-        for elem in stat_array:
-            if isinstance(elem, (list, tuple)) and len(elem) >= 2 and isinstance(elem[1], (int, float)) and elem[1] > 0:
-                prices.append(float(elem[1]))
-            elif isinstance(elem, (int, float)) and elem > 0:
-                prices.append(float(elem))
-    elif isinstance(stat_array, (int, float)) and stat_array > 0:
-        prices.append(float(stat_array))
-    return prices
+    # Removed unused helper _extract_prices_from_stat_array (cleanup)
 
 def _parse_keepa_products_with_current(products: List[dict]) -> Dict[str, Tuple[Optional[float], Optional[float], Optional[float]]]:
     """Parse Keepa products to extract min, max, and current prices with diagnostics."""

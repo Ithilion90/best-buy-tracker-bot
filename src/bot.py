@@ -263,8 +263,11 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 async def handle_shared_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    msg = await update.message.reply_text("🔍 Reading...")
-    """Handle shared Amazon links - MAIN FUNCTIONALITY"""
+    """Handle shared Amazon links - MAIN FUNCTIONALITY.
+
+    Modifica: niente placeholder "Reading...". Se il testo non contiene un link Amazon valido
+    risponde direttamente con il messaggio di comando non riconosciuto.
+    """
     await ensure_user_in_db(update)
     user = update.effective_user
     text = (update.message.text or '').strip()
@@ -287,11 +290,8 @@ async def handle_shared_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
             logger.info("Amazon short link matched via short fallback", raw=text, extracted=url)
 
     if not url:
-        lowered = text.lower()
-        if ("http://" in lowered or "https://" in lowered or "www." in lowered or 'amazon.' in lowered or 'amzn.' in lowered):
-            await update.message.reply_text(
-                "❌ Link non riconosciuto. Invia l'URL completo del prodotto Amazon."
-            )
+        # Nessun URL Amazon riconosciuto: usa stesso messaggio di unknown command
+        await update.message.reply_text("❌ Unknown command. Use /help to see the available commands.")
         return
 
     # Clean trailing punctuation common in chat messages
@@ -300,6 +300,9 @@ async def handle_shared_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # Prepend https if missing
     if not url.startswith(('http://', 'https://')):
         url = 'https://' + url
+
+    # Mostra messaggio di progresso solo ora che abbiamo un URL plausibile
+    msg = await update.message.reply_text("🔍 Processing Amazon link...")
 
     if not validate_amazon_url(url):
         await msg.edit_text("❌ Link Amazon non supportato")
@@ -315,7 +318,7 @@ async def handle_shared_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if url != original_url:
             logger.info("URL expanded/normalized", original=original_url, normalized=url)
     
-    msg = await update.message.reply_text("🔍 Processing Amazon link...")
+    # (già mostrato il messaggio di processing sopra)
     
     try:
         # Extract ASIN (after resolution/normalization)
