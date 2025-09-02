@@ -125,6 +125,14 @@ class KeepaCache:
         """Cache lifetime min/max/current for list of ASINs (optionally domain-specific)."""
         cache_key = self._compose_key("minmax_current", asins, domain)
         self.cache.set(cache_key, data, ttl)
+
+    def invalidate_lifetime_minmax_current(self, asins: List[str], domain: Optional[str] = None) -> None:
+        cache_key = self._compose_key("minmax_current", asins, domain)
+        self.cache.delete(cache_key)
+
+    def invalidate_lifetime_minmax(self, asins: List[str], domain: Optional[str] = None) -> None:
+        cache_key = self._compose_key("minmax", asins, domain)
+        self.cache.delete(cache_key)
     
     def get_product_info(self, asin: str) -> Optional[Dict[str, Any]]:
         """Get cached product info for single ASIN"""

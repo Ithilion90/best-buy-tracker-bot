@@ -11,7 +11,14 @@ try:
     from src.config import config, validate_config
     from src.logger import logger
     from src.keepa_client import fetch_lifetime_min_max, fetch_lifetime_min_max_current
-    from src.utils import extract_asin, with_affiliate, truncate, resolve_and_normalize_amazon_url
+    from src.utils import (
+        extract_asin,
+        with_affiliate,
+        truncate,
+        resolve_and_normalize_amazon_url,
+        domain_to_currency,
+        format_price,
+    )
     from src.price_fetcher import fetch_price_and_title
     from src.cache import keepa_cache  # added
 except ImportError:
@@ -19,18 +26,25 @@ except ImportError:
     from config import config, validate_config
     from logger import logger
     from keepa_client import fetch_lifetime_min_max, fetch_lifetime_min_max_current
-    from utils import extract_asin, with_affiliate, truncate, resolve_and_normalize_amazon_url
+    from utils import (
+        extract_asin,
+        with_affiliate,
+        truncate,
+        resolve_and_normalize_amazon_url,
+        domain_to_currency,
+        format_price,
+    )
     from price_fetcher import fetch_price_and_title
     from cache import keepa_cache  # added
 
 AMAZON_URL_RE = re.compile(
-    r'(https?://(?:www\.)?(?:amzn\.to|amzn\.eu|amzn\.in|amazon\.(?:com|co\.uk|de|fr|it|es|ca|co\.jp|in|com\.mx))/[^\s]+)',
+    r'((?:https?://)?(?:www\.|m\.|smile\.)?(?:amzn\.to|amzn\.eu|amzn\.in|a\.co|amzn\.asia|amazon\.(?:com|co\.uk|de|fr|it|es|ca|co\.jp|in|com\.mx))/[^\s]+)',
     re.IGNORECASE,
 )
 
 def validate_amazon_url(url: str) -> bool:
     """Validate Amazon URL"""
-    supported_domains = ['amazon.com', 'amazon.co.uk', 'amazon.de', 'amazon.fr', 'amazon.it', 'amazon.es', 'amazon.ca', 'amazon.co.jp', 'amazon.in', 'amazon.com.mx', 'amzn.to', 'amzn.eu', 'amzn.in']
+    supported_domains = ['amazon.com', 'amazon.co.uk', 'amazon.de', 'amazon.fr', 'amazon.it', 'amazon.es', 'amazon.ca', 'amazon.co.jp', 'amazon.in', 'amazon.com.mx', 'amzn.to', 'amzn.eu', 'amzn.in', 'a.co', 'amzn.asia']
     return any(domain in url.lower() for domain in supported_domains)
 
 def validate_price_consistency(current_price: float, min_price: float, max_price: float) -> tuple[float, float]:
@@ -60,34 +74,43 @@ async def ensure_user_in_db(update: Update) -> None:
         db.ensure_user(user.id, user.username, user.first_name, user.last_name)
 
 def extract_domain(url: str) -> Optional[str]:
+    """Extract and normalize the Amazon domain (strip www., m., smile.)."""
     try:
-        m = re.search(r'https?://([^/]+)/', url + '/')
-        if m:
-            host = m.group(1).lower()
-            # Only keep amazon.* hosts
-            if 'amazon.' in host or host.startswith('amzn.'):
-                return host.replace('www.', '')
-        return None
+        if not url:
+            return None
+        # Ensure we have a scheme for regex
+        tmp = url if url.startswith(('http://', 'https://')) else 'https://' + url
+        m = re.search(r'https?://([^/]+)/', tmp + '/')
+        if not m:
+            return None
+        host = m.group(1).lower()
+        if 'amazon.' not in host and not host.startswith('amzn.'):
+            return None
+        # Normalize prefixes
+        host = re.sub(r'^(?:www|m|smile)\.', '', host)
+        return host
     except Exception:
         return None
 
-async def send_price_notification(user_id: int, asin: str, title: str, old_price: float, new_price: float, min_price: float, app: Application, domain: str | None = None) -> None:
-    """Send price notification to user (domain-aware)."""
+async def send_price_notification(user_id: int, asin: str, title: str, old_price: float, new_price: float, min_price: float, app: Application, domain: str | None = None, currency: str | None = None) -> None:
+    """Send price notification to user (domain-aware, multi-currency)."""
     try:
         dom = domain or 'amazon.it'
         aff_url = with_affiliate(f"https://{dom}/dp/{asin}")
         title_display = truncate(title, 40)
         clickable_title = f"<a href=\"{aff_url}\">{title_display}</a>"
 
+        # Determine currency (priority: provided currency -> domain mapping)
+        curr = currency or domain_to_currency(dom)
         is_historical_min = abs(new_price - min_price) < 0.01 if min_price is not None else False
-        hist_line = f"🏷️ <b>Historical Min:</b> €{min_price:.2f}" if min_price is not None else ""
+        hist_line = f"🏷️ <b>Historical Min:</b> {format_price(min_price, curr)}" if min_price is not None else ""
         if is_historical_min:
             message = (
                 f"🔥 <b>HISTORICAL MINIMUM!</b> 🔥\n\n"
                 f"📦 {clickable_title}\n\n"
-                f"💰 <b>New Price:</b> €{new_price:.2f}\n"
-                f"📉 <b>Previous:</b> €{old_price:.2f}\n"
-                f"💡 <b>Savings:</b> €{old_price - new_price:.2f}\n"
+                f"💰 <b>New Price:</b> {format_price(new_price, curr)}\n"
+                f"📉 <b>Previous:</b> {format_price(old_price, curr)}\n"
+                f"💡 <b>Savings:</b> {format_price(old_price - new_price, curr)}\n"
                 f"{hist_line}\n\n"
                 f"🎯 <b>This is the lowest price ever recorded!</b>"
             )
@@ -95,9 +118,9 @@ async def send_price_notification(user_id: int, asin: str, title: str, old_price
             message = (
                 f"📉 <b>Price Drop Alert!</b>\n\n"
                 f"📦 {clickable_title}\n\n"
-                f"💰 <b>New Price:</b> €{new_price:.2f}\n"
-                f"📈 <b>Previous:</b> €{old_price:.2f}\n"
-                f"💡 <b>Savings:</b> €{old_price - new_price:.2f}\n"
+                f"💰 <b>New Price:</b> {format_price(new_price, curr)}\n"
+                f"📈 <b>Previous:</b> {format_price(old_price, curr)}\n"
+                f"💡 <b>Savings:</b> {format_price(old_price - new_price, curr)}\n"
                 f"{hist_line}"
             )
 
@@ -120,7 +143,7 @@ async def refresh_cache_and_notify(app: Application) -> None:
         if not asin_map:
             return
         asins = list(asin_map.keys())
-        keepa_bounds = fetch_lifetime_min_max_current(asins)
+        keepa_bounds = fetch_lifetime_min_max_current(asins, domain=None)
         # Scrape current concurrently
         sem = asyncio.Semaphore(10)
         async def scrape(asin: str, url: str):
@@ -210,34 +233,78 @@ async def handle_shared_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
     """Handle shared Amazon links - MAIN FUNCTIONALITY"""
     await ensure_user_in_db(update)
     user = update.effective_user
-    text = update.message.text
-    
+    text = (update.message.text or '').strip()
+
+    # Try primary regex
     m = AMAZON_URL_RE.search(text)
-    if not m:
-        # If message contains a URL but not an Amazon link, notify user once
+    url = m.group(1) if m else None
+
+    # Fallback: find token that looks like an amazon domain without protocol
+    if not url:
+        fallback_matches = re.findall(r'((?:www\.|m\.|smile\.)?amazon\.[a-z\.]{2,10}/[^\s]+)', text, re.IGNORECASE)
+        if fallback_matches:
+            url = fallback_matches[0]
+            logger.info("Amazon link matched via domain fallback", raw=text, extracted=url)
+    # Still nothing: maybe a plain amzn short form without protocol
+    if not url:
+        short_matches = re.findall(r'(?:amzn\.to|amzn\.eu|amzn\.in|a\.co|amzn\.asia)/[^\s]+', text, re.IGNORECASE)
+        if short_matches:
+            url = short_matches[0]
+            logger.info("Amazon short link matched via short fallback", raw=text, extracted=url)
+
+    if not url:
         lowered = text.lower()
-        if ("http://" in lowered or "https://" in lowered or "www." in lowered):
+        if ("http://" in lowered or "https://" in lowered or "www." in lowered or 'amazon.' in lowered or 'amzn.' in lowered):
             await update.message.reply_text(
-                "❌ Unsupported link. Please send a valid Amazon product link (amazon.* or amzn.to)."
+                "❌ Link non riconosciuto. Invia l'URL completo del prodotto Amazon."
             )
         return
-    
-    url = m.group(1)
-    
+
+    # Clean trailing punctuation common in chat messages
+    url = url.rstrip(').,]\n')
+
+    # Prepend https if missing
+    if not url.startswith(('http://', 'https://')):
+        url = 'https://' + url
+
     if not validate_amazon_url(url):
+        await msg.edit_text("❌ Link Amazon non supportato")
         return
 
     # Expand short link and normalize (/dp/ASIN) form
+    original_url = url
     try:
         url = await resolve_and_normalize_amazon_url(url)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("URL expansion failed", url=original_url, error=str(e))
+    else:
+        if url != original_url:
+            logger.info("URL expanded/normalized", original=original_url, normalized=url)
     
     msg = await update.message.reply_text("🔍 Processing Amazon link...")
     
     try:
         # Extract ASIN (after resolution/normalization)
         asin = extract_asin(url)
+        if not asin:
+            # Second chance: if it's a short domain, try a live fetch to follow redirect (already done in resolver, but safety)
+            if any(s in url for s in ("a.co/", "amzn.to", "amzn.eu", "amzn.in", "amzn.asia")):
+                try:
+                    import httpx
+                    from src.config import config as _cfg
+                except ImportError:
+                    import httpx
+                    from config import config as _cfg
+                try:
+                    async with httpx.AsyncClient(follow_redirects=True, timeout=10, headers={"User-Agent": _cfg.user_agent}) as client:
+                        resp = await client.get(url)
+                        final_url = str(resp.url)
+                        if final_url != url:
+                            logger.info("Short link second redirect followed", initial=url, final=final_url)
+                        url = final_url
+                        asin = extract_asin(url)
+                except Exception as _e:
+                    logger.warning("Short link secondary expansion failed", url=url, error=str(_e))
         if not asin:
             await msg.edit_text("❌ Cannot extract ASIN from this link")
             return
@@ -269,13 +336,14 @@ async def handle_shared_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
             title_display = truncate(title_display_full, 60)
             clickable_title_existing = f"<a href=\"{aff_url_existing}\">{title_display}</a>"
             domain_disp = existing_domain or 'n/a'
+            curr = existing.get('currency') or domain_to_currency(existing_domain)
             await msg.edit_text(
                 "📦 <b>Product Already Tracked</b>\n\n"
                 f"{clickable_title_existing}\n"
                 f"🌍 <b>Domain:</b> {domain_disp}\n"
-                f"💰 <b>Current:</b> €{current_display:.2f}\n"
-                f"📉 <b>Min:</b> €{min_display:.2f}\n"
-                f"📈 <b>Max:</b> €{max_display:.2f}\n\n"
+                f"💰 <b>Current:</b> {format_price(current_display, curr)}\n"
+                f"📉 <b>Min:</b> {format_price(min_display, curr)}\n"
+                f"📈 <b>Max:</b> {format_price(max_display, curr)}\n\n"
                 "Use /list to view all products.",
                 parse_mode="HTML",
                 disable_web_page_preview=True
@@ -292,13 +360,42 @@ async def handle_shared_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await msg.edit_text("❌ Cannot fetch current price for this product")
             return
 
-        # Get Keepa data
-        keepa_data = fetch_lifetime_min_max_current([asin])
+        # Get Keepa data (domain-specific)
+        keepa_data = fetch_lifetime_min_max_current([asin], domain=domain)
         min_price, max_price, current_price_from_keepa = keepa_data.get(asin, (None, None, None))
 
-        if not min_price or not max_price:
-            await msg.edit_text("❌ No price data found for this product")
-            return
+        # Fallback: if Keepa has no history yet, initialize with current price
+        force_refetched = False
+        if min_price is None or max_price is None:
+            if current_price is not None:
+                min_price = max_price = current_price
+                logger.info("Initialized min/max from current price (no Keepa history)", asin=asin, current=current_price)
+            elif current_price_from_keepa is not None:
+                min_price = max_price = current_price_from_keepa
+                current_price = current_price or current_price_from_keepa
+                logger.info("Initialized min/max from Keepa current (no Keepa history)", asin=asin, current=current_price_from_keepa)
+            else:
+                # As a last attempt try simpler Keepa call without current
+                alt_bounds = fetch_lifetime_min_max([asin], domain=domain)
+                alt_min, alt_max = alt_bounds.get(asin, (None, None))
+                if alt_min is not None and alt_max is not None:
+                    min_price, max_price = alt_min, alt_max
+                    logger.info("Recovered min/max via secondary Keepa call", asin=asin, min=min_price, max=max_price)
+                else:
+                    await msg.edit_text("❌ No price data found for this product (ASIN history empty)")
+                    return
+            # Try a forced fresh Keepa fetch to see if history becomes available immediately
+            if min_price and max_price and current_price and min_price == max_price == current_price:
+                try:
+                    force_data = fetch_lifetime_min_max_current([asin], domain=domain, force=True)
+                    fmin, fmax, fcur = force_data.get(asin, (None, None, None))
+                    if fmin and fmax and (fmin != fmax or fmin != current_price):
+                        min_price, max_price = fmin, fmax
+                        current_price_from_keepa = fcur or current_price_from_keepa
+                        force_refetched = True
+                        logger.info("Force refetch obtained historical bounds", asin=asin, min=min_price, max=max_price)
+                except Exception as fe:
+                    logger.warning("Force refetch failed", asin=asin, error=str(fe))
 
         # Use current price if available, otherwise fallback to current_price_from_keepa 
         if not current_price:
@@ -329,12 +426,13 @@ async def handle_shared_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
         aff_url = with_affiliate(url)
         title_display = truncate(title, 60)
         clickable_title = f"<a href=\"{aff_url}\">{title_display}</a>"
+        curr_added = currency or domain_to_currency(domain)
         response = (
             f"✅ <b>Product Added!</b>\n\n"
             f"📦 {clickable_title}\n"
-            f"💰 <b>Current Price:</b> €{current_price:.2f}\n"
-            f"📉 <b>Min Price:</b> €{corrected_min:.2f}\n"
-            f"📈 <b>Max Price:</b> €{corrected_max:.2f}\n\n"
+            f"💰 <b>Current Price:</b> {format_price(current_price, curr_added)}\n"
+            f"📉 <b>Min Price:</b> {format_price(corrected_min, curr_added)}\n"
+            f"📈 <b>Max Price:</b> {format_price(corrected_max, curr_added)}\n\n"
             f"📢 <b>You'll be notified when the price change!</b>"
         )
         # Cache the exact values shown to the user BEFORE sending response to guarantee consistency with /list
@@ -418,11 +516,12 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             title_disp = truncate(r['title'] or f"Product {asin}", 40)
             aff_url = with_affiliate(r['url'])
             clickable = f"<a href=\"{aff_url}\">{title_disp}</a>"
+            curr_row = r.get('currency') or domain_to_currency(dom)
             line = f"{i}. {clickable}\n"
             line += f"   🌍 <b>Domain:</b> {dom or 'n/a'}\n"
-            line += f"   💰 <b>Current:</b> €{cur_p:.2f}\n"
-            line += f"   📉 <b>Min:</b> €{min_p:.2f}\n"
-            line += f"   📈 <b>Max:</b> €{max_p:.2f}"
+            line += f"   💰 <b>Current:</b> {format_price(cur_p, curr_row)}\n"
+            line += f"   📉 <b>Min:</b> {format_price(min_p, curr_row)}\n"
+            line += f"   📈 <b>Max:</b> {format_price(max_p, curr_row)}"
             lines.append(line)
         if len(lines) == 1:
             await msg.edit_text("❌ No data available for tracked products")
