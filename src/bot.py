@@ -170,17 +170,19 @@ async def refresh_cache_and_notify(app: Application) -> None:
         items = db.get_all_items()
         if not items:
             return
-        asin_map: dict[str, list[dict]] = {}
+        # Group by domain -> asin -> list[item]
+        domain_group: dict[str, dict[str, list[dict]]] = {}
         for it in items:
-            a = it.get('asin')
-            if a:
-                asin_map.setdefault(a, []).append(it)
-        if not asin_map:
+            asin = it.get('asin')
+            if not asin:
+                continue
+            dom = it.get('domain') or extract_domain(it.get('url') or '') or (getattr(config, 'keepa_domain', 'amazon.com'))
+            domain_group.setdefault(dom, {}).setdefault(asin, []).append(it)
+        if not domain_group:
             return
-        asins = list(asin_map.keys())
-        keepa_bounds = fetch_lifetime_min_max_current(asins, domain=None)
-        # Scrape current concurrently
+
         sem = asyncio.Semaphore(10)
+
         async def scrape(asin: str, url: str):
             async with sem:
                 try:
@@ -189,52 +191,65 @@ async def refresh_cache_and_notify(app: Application) -> None:
                 except Exception as e:
                     logger.warning("Refresh scrape failed", asin=asin, error=str(e))
                     return asin, None, None
-        tasks = [scrape(a, lst[0]['url']) for a, lst in asin_map.items() if lst and lst[0].get('url')]
-        scrape_results = {}
-        if tasks:
-            for asin, t, p in await asyncio.gather(*tasks):
-                scrape_results[asin] = (t, p)
-        cache_updates = {}
-        for asin, lst in asin_map.items():
-            k_min, k_max, k_cur = keepa_bounds.get(asin, (None, None, None)) if keepa_bounds else (None, None, None)
-            scraped_title, scraped_price = scrape_results.get(asin, (None, None))
-            if k_min is None or k_max is None:
-                if scraped_price is not None:
-                    k_min = k_max = scraped_price
-                else:
-                    lp = lst[0].get('last_price')
-                    if isinstance(lp, (int, float)):
-                        k_min = k_max = lp
-            if k_min is None or k_max is None:
-                continue
-            current_price = scraped_price if scraped_price is not None else (k_cur if k_cur is not None else (k_min + k_max) / 2)
-            adj_min, adj_max = validate_price_consistency(current_price, k_min, k_max)
-            cache_updates[asin] = (adj_min, adj_max, current_price)
-            for item in lst:
-                old_price = item.get('last_price')
-                if isinstance(old_price, (int, float)):
-                    drop = old_price - current_price
-                    if drop > 1.0 or (old_price > 0 and drop / old_price > 0.05):
-                        # Derive domain for notification
-                        item_domain = item.get('domain') or extract_domain(item.get('url') or '')
-                        # Optionally persist domain if missing
-                        if item_domain and not item.get('domain'):
-                            try:
-                                db.update_item_domain(item['id'], item_domain)
-                            except Exception:
-                                pass
-                        await send_price_notification(item['user_id'], asin, item['title'] or (scraped_title or f"Product {asin}"), old_price, current_price, adj_min, app, domain=item_domain)
+
+        total_cache_updates = 0
+        for dom, asin_map in domain_group.items():
+            asins_dom = list(asin_map.keys())
+            # Fetch Keepa per domain
+            keepa_bounds_dom = fetch_lifetime_min_max_current(asins_dom, domain=dom)
+            # Scrape first URL per asin concurrently
+            tasks = [scrape(a, lst[0].get('url')) for a, lst in asin_map.items() if lst and lst[0].get('url')]
+            scrape_results: dict[str, tuple[str | None, float | None]] = {}
+            if tasks:
+                for asin, t, p in await asyncio.gather(*tasks):
+                    scrape_results[asin] = (t, p)
+            cache_updates_dom: dict[str, tuple[float, float, float]] = {}
+            for asin, lst in asin_map.items():
+                k_min, k_max, k_cur = keepa_bounds_dom.get(asin, (None, None, None)) if keepa_bounds_dom else (None, None, None)
+                scraped_title, scraped_price = scrape_results.get(asin, (None, None))
+
+                # Fallback similar to add flow if Keepa lacks history
+                if k_min is None or k_max is None:
+                    if scraped_price is not None:
+                        k_min = k_max = scraped_price
+                    elif k_cur is not None:
+                        k_min = k_max = k_cur
+                    else:
+                        # fallback to last_price in DB
+                        lp = lst[0].get('last_price')
+                        if isinstance(lp, (int, float)):
+                            k_min = k_max = lp
+                if k_min is None or k_max is None:
+                    continue
+                current_price = scraped_price if scraped_price is not None else (k_cur if k_cur is not None else (k_min + k_max) / 2)
+                adj_min, adj_max = validate_price_consistency(current_price, k_min, k_max)
+                cache_updates_dom[asin] = (adj_min, adj_max, current_price)
+
+                for item in lst:
+                    old_price = item.get('last_price')
+                    try:
+                        db.update_price_bounds(item['id'], adj_min, adj_max)
+                        db.update_price(item['id'], current_price)
+                    except Exception as e:
+                        logger.warning("Refresh DB update failed", item_id=item['id'], error=str(e))
+                    if isinstance(old_price, (int, float)):
+                        drop = old_price - current_price
+                        if drop > 1.0 or (old_price > 0 and drop / old_price > 0.05):
+                            # Persist domain if missing
+                            if dom and not item.get('domain'):
+                                try:
+                                    db.update_item_domain(item['id'], dom)
+                                except Exception:
+                                    pass
+                            await send_price_notification(item['user_id'], asin, item.get('title') or (scraped_title or f"Product {asin}"), old_price, current_price, adj_min, app, domain=dom)
+
+            if cache_updates_dom:
                 try:
-                    db.update_price_bounds(item['id'], adj_min, adj_max)
-                    db.update_price(item['id'], current_price)
+                    keepa_cache.set_lifetime_minmax_current(asins_dom, cache_updates_dom, domain=dom)
                 except Exception as e:
-                    logger.warning("Refresh DB update failed", item_id=item['id'], error=str(e))
-        if cache_updates:
-            try:
-                keepa_cache.set_lifetime_minmax_current(asins, cache_updates)
-            except Exception as e:
-                logger.warning("Refresh cache write failed", error=str(e))
-        logger.info("Refresh cycle complete", asins=len(cache_updates))
+                    logger.warning("Refresh cache write failed", domain=dom, error=str(e))
+                total_cache_updates += len(cache_updates_dom)
+        logger.info("Refresh cycle complete", domains=len(domain_group), asins=total_cache_updates)
     except Exception as e:
         logger.error("Refresh cycle error", error=str(e))
 
