@@ -19,7 +19,7 @@ try:
         domain_to_currency,
         format_price,
     )
-    from src.price_fetcher import fetch_price_and_title
+    from src.price_fetcher import fetch_price_title_image
     from src.cache import keepa_cache  # added
 except ImportError:
     import db
@@ -34,7 +34,7 @@ except ImportError:
         domain_to_currency,
         format_price,
     )
-    from price_fetcher import fetch_price_and_title
+    from price_fetcher import fetch_price_title_image
     from cache import keepa_cache  # added
 
 AMAZON_URL_RE = re.compile(
@@ -124,7 +124,41 @@ async def send_price_notification(user_id: int, asin: str, title: str, old_price
                 f"{hist_line}"
             )
 
-        await app.bot.send_message(chat_id=user_id, text=message, parse_mode="HTML", disable_web_page_preview=True)
+        # Try to fetch image (scrape on-demand). Not cached to keep simple (caching would be feature 2).
+        image_url: Optional[str] = None
+        try:
+            from src.price_fetcher import fetch_price_title_image  # local import to avoid cycles
+        except ImportError:
+            from price_fetcher import fetch_price_title_image  # type: ignore
+        try:
+            _t, _p, _c, img = await fetch_price_title_image(aff_url)
+            image_url = img
+        except Exception:
+            image_url = None
+
+        def _thumbnail(u: Optional[str]) -> Optional[str]:
+            if not u or not isinstance(u, str):
+                return None
+            # Amazon image URLs often allow size modifiers like ._AC_SX342_. before extension
+            import re as _re
+            m = _re.search(r'(https://[^\s]+?)(\.[a-zA-Z]{3,4})(?:\?.*)?$', u)
+            if not m:
+                return u
+            base, ext = m.group(1), m.group(2)
+            if '._AC_' in base or '._SX' in base:
+                return u  # already sized
+            # Insert a modest width spec to reduce payload
+            return f"{base}._AC_SX342_{ext}"
+
+        image_url = _thumbnail(image_url)
+
+        if image_url:
+            try:
+                await app.bot.send_photo(chat_id=user_id, photo=image_url, caption=message, parse_mode="HTML")
+            except Exception:
+                await app.bot.send_message(chat_id=user_id, text=message, parse_mode="HTML", disable_web_page_preview=True)
+        else:
+            await app.bot.send_message(chat_id=user_id, text=message, parse_mode="HTML", disable_web_page_preview=True)
         logger.info("Price notification sent", user_id=user_id, asin=asin, domain=dom, old_price=old_price, new_price=new_price, is_historical_min=is_historical_min)
     except Exception as e:
         logger.error("Error sending notification", error=str(e), user_id=user_id, asin=asin)
@@ -149,7 +183,7 @@ async def refresh_cache_and_notify(app: Application) -> None:
         async def scrape(asin: str, url: str):
             async with sem:
                 try:
-                    title_s, price_s, _c = await fetch_price_and_title(url)
+                    title_s, price_s, _c, _img = await fetch_price_title_image(url)
                     return asin, title_s, price_s
                 except Exception as e:
                     logger.warning("Refresh scrape failed", asin=asin, error=str(e))
@@ -352,8 +386,8 @@ async def handle_shared_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
             logger.info("Duplicate link relayed from cache (data shown)", asin=asin, user_id=user.id, domain=existing_domain)
             return
 
-        # Get product title and current price (use resolved URL)
-        title, current_price, currency = await fetch_price_and_title(url)
+        # Get product title, current price and image (use resolved URL)
+        title, current_price, currency, image_url = await fetch_price_title_image(url)
         if not title:
             title = f"Amazon Product {asin}"
 
@@ -452,7 +486,14 @@ async def handle_shared_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
             })
         except Exception as e:
             logger.warning("Failed to update keepa cache on add", asin=asin, error=str(e))
-        await msg.edit_text(response, parse_mode="HTML", disable_web_page_preview=True)
+        if image_url:
+            try:
+                await msg.delete()
+                await context.bot.send_photo(chat_id=user.id, photo=image_url, caption=response, parse_mode="HTML")
+            except Exception:
+                await msg.edit_text(response, parse_mode="HTML", disable_web_page_preview=True)
+        else:
+            await msg.edit_text(response, parse_mode="HTML", disable_web_page_preview=True)
         logger.info("Product added via shared link", asin=asin, domain=domain, title=title[:30], current_price=current_price, min_price=corrected_min, max_price=corrected_max)
         
     except Exception as e:

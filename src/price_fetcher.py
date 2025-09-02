@@ -88,7 +88,7 @@ async def fetch_html(client: httpx.AsyncClient, url: str) -> Optional[str]:
         logger.error("Error fetching page", url=url[:50], error=str(e))
         return None
 
-def extract_title_and_price(html: str):
+def extract_title_price_image(html: str):
     soup = BeautifulSoup(html, "html.parser")
 
     title = None
@@ -113,6 +113,7 @@ def extract_title_and_price(html: str):
 
     price = None
     currency = None
+    image_url: Optional[str] = None
     if not price_text:
         # Attempt to build from whole + fraction parts (common in some locales)
         whole = soup.select_one('span.a-price-whole')
@@ -125,14 +126,54 @@ def extract_title_and_price(html: str):
     if price_text:
         price, currency = parse_price_text(price_text)
 
-    return title, price, currency
+    # Image selectors (try high-res first, then fallback)
+    img_selectors = [
+        '#landingImage',
+        '#imgTagWrapperId img',
+        'img#imgBlkFront',
+        'img[data-old-hires]',
+        'div#main-image-container img',
+    ]
+    for sel in img_selectors:
+        el = soup.select_one(sel)
+        if not el:
+            continue
+        cand = el.get('data-old-hires') or el.get('data-a-dynamic-image') or el.get('src')
+        if not cand:
+            continue
+        # data-a-dynamic-image is a JSON-like string {"url1":[w,h],...}
+        if '"' in cand and '{' in cand:
+            import json, re as _re
+            try:
+                # Normalize quotes if needed
+                json_text = cand if cand.strip().startswith('{') else '{' + cand.split('{',1)[1]
+                mapping = json.loads(json_text)
+                if isinstance(mapping, dict):
+                    # pick largest width image
+                    best = None
+                    best_w = -1
+                    for k,v in mapping.items():
+                        if isinstance(v, (list, tuple)) and len(v)>=2 and isinstance(v[0], (int,float)):
+                            if v[0] > best_w:
+                                best = k
+                                best_w = v[0]
+                    if best:
+                        image_url = best
+                        break
+            except Exception:
+                pass
+        else:
+            image_url = cand
+            break
 
-async def fetch_price_and_title(url: str):
+    return title, price, currency, image_url
+
+async def fetch_price_title_image(url: str):
     async with httpx.AsyncClient(follow_redirects=True) as client:
         html = await fetch_html(client, url)
         if not html:
-            return None, None, None
-        return extract_title_and_price(html)
+            return None, None, None, None
+        return extract_title_price_image(html)
 
 async def get_scraped_current_price(url: str, asin: str):
     """Return (title, price, currency) for ASIN using cache; scrape if stale/missing."""
@@ -140,7 +181,7 @@ async def get_scraped_current_price(url: str, asin: str):
     if cached is not None:
         # We don't store title/currency reliably in cache; we may return None for them
         return None, cached, None
-    title, price, currency = await fetch_price_and_title(url)
+    title, price, currency, _img = await fetch_price_title_image(url)
     if price is not None:
         set_cached_current_price(asin, price, title, currency)
     return title, price, currency
