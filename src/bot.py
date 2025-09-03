@@ -412,8 +412,9 @@ async def handle_shared_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if not current_price:
             await msg.edit_text("❌ Cannot fetch current price for this product")
             return
-
+        
         # Get Keepa data (domain-specific)
+        await msg.edit_text("⏳ Fetching historical data...")
         keepa_data = fetch_lifetime_min_max_current([asin], domain=domain)
         min_price, max_price, current_price_from_keepa = keepa_data.get(asin, (None, None, None))
 
@@ -457,6 +458,20 @@ async def handle_shared_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
         # Validate price consistency - adjust min/max if needed but keep current price
         corrected_min, corrected_max = validate_price_consistency(current_price, min_price, max_price)
 
+        # Create affiliate link for display
+        aff_url = with_affiliate(url)
+        title_display = truncate(title, 60)
+        clickable_title = f"<a href=\"{aff_url}\">{title_display}</a>"
+        curr_added = currency or domain_to_currency(domain)
+        response = (
+            f"✅ <b>Product Added!</b>\n\n"
+            f"📦 {clickable_title}\n"
+            f"💰 <b>Current Price:</b> {format_price(current_price, curr_added)}\n"
+            f"📉 <b>Min Price:</b> {format_price(corrected_min, curr_added)}\n"
+            f"📈 <b>Max Price:</b> {format_price(corrected_max, curr_added)}\n\n"
+            f"📢 <b>You'll be notified when the price change!</b>"
+        )
+
         # Add to database with current price (DB insert sets min/max equal to current)
         item_id = db.add_item(
             user_id=user.id,
@@ -474,20 +489,7 @@ async def handle_shared_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 db.update_price_bounds(item_id, corrected_min, corrected_max)
         except Exception as e:
             logger.warning("Failed to update initial DB bounds", asin=asin, error=str(e))
-
-        # Create affiliate link for display
-        aff_url = with_affiliate(url)
-        title_display = truncate(title, 60)
-        clickable_title = f"<a href=\"{aff_url}\">{title_display}</a>"
-        curr_added = currency or domain_to_currency(domain)
-        response = (
-            f"✅ <b>Product Added!</b>\n\n"
-            f"📦 {clickable_title}\n"
-            f"💰 <b>Current Price:</b> {format_price(current_price, curr_added)}\n"
-            f"📉 <b>Min Price:</b> {format_price(corrected_min, curr_added)}\n"
-            f"📈 <b>Max Price:</b> {format_price(corrected_max, curr_added)}\n\n"
-            f"📢 <b>You'll be notified when the price change!</b>"
-        )
+        
         # Cache the exact values shown to the user BEFORE sending response to guarantee consistency with /list
         try:
             keepa_cache.set_lifetime_minmax_current([asin], {asin: (corrected_min, corrected_max, current_price)}, domain=domain)
