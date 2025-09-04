@@ -770,6 +770,19 @@ def main() -> None:
             msg_lines.append(f"Raw Stats Min (cents): {raw_min}")
         if isinstance(raw_max, (int, float)):
             msg_lines.append(f"Raw Stats Max (cents): {raw_max}")
+            # Reasons / samples
+            if 'stats_min_reason' in dbg:
+                msg_lines.append(f"Min Reason: {dbg.get('stats_min_reason')}")
+            if 'stats_max_reason' in dbg:
+                msg_lines.append(f"Max Reason: {dbg.get('stats_max_reason')}")
+            if 'stats_current_reason' in dbg:
+                msg_lines.append(f"Current Reason: {dbg.get('stats_current_reason')}")
+            if dbg.get('stats_min_sample'):
+                msg_lines.append(f"Min Sample: {dbg.get('stats_min_sample')}")
+            if dbg.get('stats_max_sample'):
+                msg_lines.append(f"Max Sample: {dbg.get('stats_max_sample')}")
+            if dbg.get('stats_current_sample'):
+                msg_lines.append(f"Current Sample: {dbg.get('stats_current_sample')}")
         sample = dbg.get('sample_prices') or []
         if sample:
             msg_lines.append("Sample History Prices: " + ", ".join(str(s) for s in sample))

@@ -51,10 +51,69 @@ def fetch_keepa_debug_data(asin: str, domain: Optional[str] = None) -> Dict[str,
             return {"error": "No product data returned"}
         p = products[0]
         stats = p.get("stats", {}) or {}
-        # Raw stats (cents)
-        raw_min = stats.get("min")
-        raw_max = stats.get("max")
-        raw_current = stats.get("current")
+        # Raw stats (cents) original entries (could be scalar / list / dict)
+        raw_min_entry = stats.get("min")
+        raw_max_entry = stats.get("max")
+        raw_current_entry = stats.get("current")
+
+        # Helper to introspect how _pick_amazon_stat would interpret a stat
+        def _debug_interpret(entry) -> Tuple[Optional[float], Optional[str], Optional[Any]]:
+            rationale = None
+            sample = None
+            if entry is None:
+                return None, "missing", None
+            if isinstance(entry, (int, float)):
+                if 0 < entry < 2_000_000:
+                    return float(entry), "scalar", entry
+                else:
+                    return None, "scalar_out_of_range", entry
+            if isinstance(entry, (list, tuple)):
+                if len(entry) == 0:
+                    return None, "empty_list", None
+                primary = entry[0]
+                if isinstance(primary, (list, tuple)) and len(primary) >= 2:
+                    a, b = primary[0], primary[1]
+                    sample = [a, b]
+                    # Mirror logic from _pick_amazon_stat.extract_from_pair
+                    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+                        if a > 2_000_000 and b < 2_000_000:
+                            return float(b), "pair_b_is_price", sample
+                        if b > 2_000_000 and a < 2_000_000:
+                            return float(a), "pair_a_is_price", sample
+                        if a < 200_000 and b > 200_000:
+                            return float(a), "pair_a_lt_threshold", sample
+                        if 0 < a < 2_000_000:
+                            return float(a), "pair_first_assumed_price", sample
+                # Fallback scan
+                for v in entry:
+                    if isinstance(v, (list, tuple)) and len(v) >= 2:
+                        a, b = v[0], v[1]
+                        sample = [a, b]
+                        if isinstance(a, (int, float)) and 0 < a < 2_000_000:
+                            return float(a), "scan_pair_first", sample
+                        if isinstance(b, (int, float)) and 0 < b < 2_000_000:
+                            return float(b), "scan_pair_second", sample
+                    elif isinstance(v, (int, float)) and 0 < v < 2_000_000:
+                        return float(v), "scan_scalar", v
+                return None, "list_no_price", None
+            if isinstance(entry, dict):
+                for k in ("AMAZON", "amazon", "AMZ", 0, "0", "NEW", "new", 1, "1"):
+                    v = entry.get(k)
+                    if isinstance(v, (int, float)) and 0 < v < 2_000_000:
+                        return float(v), f"dict_key:{k}", v
+                    if isinstance(v, (list, tuple)) and len(v) >= 2:
+                        a, b = v[0], v[1]
+                        sample = [a, b]
+                        if isinstance(a, (int, float)) and 0 < a < 2_000_000:
+                            return float(a), f"dict_pair_first:{k}", sample
+                        if isinstance(b, (int, float)) and 0 < b < 2_000_000:
+                            return float(b), f"dict_pair_second:{k}", sample
+                return None, "dict_no_price", None
+            return None, "unhandled_type", str(type(entry))
+
+        raw_min, min_reason, min_sample = _debug_interpret(raw_min_entry)
+        raw_max, max_reason, max_sample = _debug_interpret(raw_max_entry)
+        raw_current, cur_reason, cur_sample = _debug_interpret(raw_current_entry)
         # Use existing parser for final interpreted values
         parsed = _parse_keepa_products_with_current([p])
         parsed_min, parsed_max, parsed_current = parsed.get(asin, (None, None, None))
@@ -73,6 +132,15 @@ def fetch_keepa_debug_data(asin: str, domain: Optional[str] = None) -> Dict[str,
             "stats_min_raw": raw_min,
             "stats_max_raw": raw_max,
             "stats_current_raw": raw_current,
+            "stats_min_entry": raw_min_entry,
+            "stats_max_entry": raw_max_entry,
+            "stats_current_entry": raw_current_entry,
+            "stats_min_reason": min_reason,
+            "stats_max_reason": max_reason,
+            "stats_current_reason": cur_reason,
+            "stats_min_sample": min_sample,
+            "stats_max_sample": max_sample,
+            "stats_current_sample": cur_sample,
             "parsed_min": parsed_min,
             "parsed_max": parsed_max,
             "parsed_current": parsed_current,
@@ -218,47 +286,74 @@ def _fetch_from_pykeepa(key: str, asin_list: List[str], domain: Optional[str]) -
 
 
 def _pick_amazon_stat(stats: dict, key: str) -> Optional[float]:
-    """Return the Amazon stat value (in cents) from a Keepa stats dict for the given key.
-    Handles shapes: scalar, list/tuple (index 0 assumed Amazon), or dict with common labels.
+    """Extract Amazon price (in cents) for the requested stat key.
+
+    Root cause of previous exaggerated max values: we treated list-pair entries
+    as [timestamp, price] and picked the second element, but Keepa returns
+    pairs as [price, timestamp]. That caused us to sometimes interpret a large
+    timestamp (minutes since a reference epoch) as the price producing huge
+    max values.
+
+    Heuristics:
+    - Prefer index 0 (Amazon) if scalar or pair.
+    - For a 2-length pair (a,b) decide which is price:
+        * If one element > 2_000_000 and the other < 2_000_000 -> smaller is price.
+        * Else if a < 200_000 and b > 200_000 -> a is price.
+        * Else assume first element is price (Keepa spec: [price, time]).
+    - Skip obvious timestamp-only numbers (> 2_000_000) when alone.
+    - Fallback: scan list for first plausible price 1..2_000_000.
+    - Dict form: try common labels.
     """
     val = stats.get(key)
     if val is None:
         return None
-    # List/tuple form: prefer index 0 (Amazon), then fall back to the first valid entry
+
+    def extract_from_pair(a, b):
+        # Identify timestamp vs price by magnitude
+        if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+            if a > 2_000_000 and b < 2_000_000:
+                return b
+            if b > 2_000_000 and a < 2_000_000:
+                return a
+            if a < 200_000 and b > 200_000:  # typical price cents (<2000.00) vs timestamp
+                return a
+            # Default Keepa ordering
+            return a
+        return None
+
     if isinstance(val, (list, tuple)):
-        # Some Keepa shapes are list-of-pairs: [[price, when], None, ...].
-        # Try likely Amazon index first, then others.
-        candidate_indices = (0, 2, 3, 4, 5, 1)
-        for idx in candidate_indices:
-            if idx < len(val):
-                v = val[idx]
-                # Pair like [price, when] - take the SECOND element (price)
-                if isinstance(v, (list, tuple)) and len(v) >= 2:
-                    price = v[1]  # Second element is the price in cents
-                else:
-                    price = v
-                if isinstance(price, (int, float)) and math.isfinite(price) and price >= 0:
-                    return float(price)
-        # As a last resort, scan all entries and return the first valid numeric (pair[1] if needed)
+        # Direct candidates (Amazon condition usually at index 0)
+        primary = val[0] if len(val) > 0 else None
+        candidates = []
+        if isinstance(primary, (list, tuple)) and len(primary) >= 2:
+            price = extract_from_pair(primary[0], primary[1])
+            if isinstance(price, (int, float)) and 0 < price < 2_000_000:
+                return float(price)
+        elif isinstance(primary, (int, float)) and 0 < primary < 2_000_000:
+            return float(primary)
+        # Scan remaining entries
         for v in val:
             price = None
             if isinstance(v, (list, tuple)) and len(v) >= 2:
-                price = v[1]  # Take price from [timestamp, price] pair
+                price = extract_from_pair(v[0], v[1])
             elif isinstance(v, (int, float)):
-                price = v
-            if isinstance(price, (int, float)) and math.isfinite(price) and price >= 0:
+                price = v if 0 < v < 2_000_000 else None
+            if isinstance(price, (int, float)) and 0 < price < 2_000_000:
                 return float(price)
         return None
-    # Dict form: try common labels
+
     if isinstance(val, dict):
-        # Try common labels then numeric keys (as int and string)
         for k in ("AMAZON", "amazon", "AMZ", 0, "0", "NEW", "new", 1, "1"):
             v = val.get(k)
-            if isinstance(v, (int, float)) and math.isfinite(v) and v >= 0:
+            if isinstance(v, (int, float)) and 0 < v < 2_000_000:
                 return float(v)
+            if isinstance(v, (list, tuple)) and len(v) >= 2:
+                extracted = extract_from_pair(v[0], v[1])
+                if isinstance(extracted, (int, float)) and 0 < extracted < 2_000_000:
+                    return float(extracted)
         return None
-    # Scalar form
-    if isinstance(val, (int, float)):
+
+    if isinstance(val, (int, float)) and 0 < val < 2_000_000:
         return float(val)
     return None
 
