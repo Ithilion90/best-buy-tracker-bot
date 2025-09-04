@@ -126,6 +126,36 @@ def fetch_keepa_debug_data(asin: str, domain: Optional[str] = None) -> Dict[str,
                     break
                 if idx % 2 == 1 and isinstance(v, (int, float)) and v > 0:
                     sample_prices.append(round(v / 100.0, 2))
+        # Additional context: list price / buy box if present
+        def _pick_first(stats_dict, keys):
+            for k in keys:
+                if k in stats_dict:
+                    return stats_dict.get(k)
+            return None
+        list_entry = _pick_first(stats, ("list", "listPrice", "LIST", "LISTPRICE"))
+        buybox_entry = _pick_first(stats, ("buyBox", "BUYBOX", "buyBoxNew", "buyBoxUsed"))
+        # Interpret list/buybox similarly (raw numeric or pair)
+        def _interpret_simple(entry):
+            if isinstance(entry, (int, float)) and 0 < entry < 2_000_000:
+                return round(entry / 100.0, 2)
+            if isinstance(entry, (list, tuple)) and len(entry) >= 1:
+                v = entry[0]
+                if isinstance(v, (int, float)) and 0 < v < 2_000_000:
+                    return round(v / 100.0, 2)
+            return None
+        list_price = _interpret_simple(list_entry)
+        buybox_price = _interpret_simple(buybox_entry)
+
+        # Basic anomaly classification
+        anomaly = None
+        if isinstance(parsed_max, (int, float)) and isinstance(parsed_min, (int, float)):
+            if list_price and abs(parsed_max - list_price) < 0.01 and parsed_max > parsed_min * 2:
+                anomaly = "max_equals_list_price"
+            elif buybox_price and parsed_max > buybox_price * 3:
+                anomaly = "max_far_above_buybox"
+            elif parsed_max > parsed_min * 15:
+                anomaly = "max_min_ratio_outlier"
+
         return {
             "asin": asin,
             "domain": domain or getattr(config, "keepa_domain", "com"),
@@ -147,6 +177,9 @@ def fetch_keepa_debug_data(asin: str, domain: Optional[str] = None) -> Dict[str,
             "history_min": round(hmin / 100.0, 2) if isinstance(hmin, (int, float)) and hmin > 0 else None,
             "history_max": round(hmax / 100.0, 2) if isinstance(hmax, (int, float)) and hmax > 0 else None,
             "sample_prices": sample_prices,
+            "list_price": list_price,
+            "buybox_price": buybox_price,
+            "anomaly": anomaly,
         }
     except Exception as e:  # pragma: no cover - diagnostic
         try:

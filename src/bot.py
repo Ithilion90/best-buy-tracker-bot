@@ -783,6 +783,12 @@ def main() -> None:
                 msg_lines.append(f"Max Sample: {dbg.get('stats_max_sample')}")
             if dbg.get('stats_current_sample'):
                 msg_lines.append(f"Current Sample: {dbg.get('stats_current_sample')}")
+            if dbg.get('list_price') is not None:
+                msg_lines.append(f"List Price: {dbg.get('list_price')}")
+            if dbg.get('buybox_price') is not None:
+                msg_lines.append(f"BuyBox Price: {dbg.get('buybox_price')}")
+            if dbg.get('anomaly'):
+                msg_lines.append(f"Anomaly Classification: {dbg.get('anomaly')}")
         sample = dbg.get('sample_prices') or []
         if sample:
             msg_lines.append("Sample History Prices: " + ", ".join(str(s) for s in sample))
