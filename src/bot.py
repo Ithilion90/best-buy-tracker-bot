@@ -317,8 +317,28 @@ async def handle_shared_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not url.startswith(('http://', 'https://')):
         url = 'https://' + url
 
-    # Mostra messaggio di progresso solo ora che abbiamo un URL plausibile
-    msg = await update.message.reply_text("🔍 Processing Amazon link...")
+    # Mostra messaggio di progresso dinamico solo ora che abbiamo un URL plausibile
+    msg = await update.message.reply_text("⏳ Processing Amazon link...")
+
+    async def _spinner(message, base_text: str, frames: list[str], stop_event: asyncio.Event, interval: float = 0.7):
+        i = 0
+        last_render = None
+        while not stop_event.is_set():
+            frame = frames[i % len(frames)]
+            text = f"{frame} {base_text}"
+            if text != last_render:  # evita edit identici
+                try:
+                    await message.edit_text(text)
+                except Exception:
+                    pass
+                last_render = text
+            await asyncio.sleep(interval)
+            i += 1
+
+    # Avvia primo spinner (analisi URL / scraping iniziale)
+    spinner_stop_1 = asyncio.Event()
+    # Hourglass animation (simulate vertical ↔ horizontal by alternating filled/empty variants)
+    spinner_task_1 = asyncio.create_task(_spinner(msg, "Processing Amazon link...", ["⏳", "⌛"], spinner_stop_1, 0.7))
 
     if not validate_amazon_url(url):
         await msg.edit_text("❌ Link Amazon non supportato")
@@ -414,7 +434,14 @@ async def handle_shared_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
             return
         
         # Get Keepa data (domain-specific)
-        await msg.edit_text("⏳ Fetching historical data...")
+        # Ferma il primo spinner e avvia il secondo (storico Keepa)
+        spinner_stop_1.set()
+        try:
+            await asyncio.sleep(0)  # yield to let spinner stop
+        except Exception:
+            pass
+        spinner_stop_2 = asyncio.Event()
+        spinner_task_2 = asyncio.create_task(_spinner(msg, "Fetching price history...", ["⌛", "⏳"], spinner_stop_2, 0.7))
         keepa_data = fetch_lifetime_min_max_current([asin], domain=domain)
         min_price, max_price, current_price_from_keepa = keepa_data.get(asin, (None, None, None))
 
@@ -506,6 +533,14 @@ async def handle_shared_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
             })
         except Exception as e:
             logger.warning("Failed to update keepa cache on add", asin=asin, error=str(e))
+        # Ferma eventuale spinner attivo prima della risposta finale
+        try:
+            if 'spinner_stop_2' in locals():
+                spinner_stop_2.set()
+            else:
+                spinner_stop_1.set()
+        except Exception:
+            pass
         if image_url:
             try:
                 await msg.delete()
@@ -517,6 +552,13 @@ async def handle_shared_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
         logger.info("Product added via shared link", asin=asin, domain=domain, title=title[:30], current_price=current_price, min_price=corrected_min, max_price=corrected_max)
         
     except Exception as e:
+        try:
+            if 'spinner_stop_1' in locals():
+                spinner_stop_1.set()
+            if 'spinner_stop_2' in locals():
+                spinner_stop_2.set()
+        except Exception:
+            pass
         logger.error("Error processing shared link", error=str(e))
         await msg.edit_text("❌ Error processing the link")
 
