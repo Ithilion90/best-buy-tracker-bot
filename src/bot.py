@@ -707,8 +707,11 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 def main() -> None:
     validate_config()
     db.init_db()
-    
-    logger.info("Starting Amazon Keepa Price Tracker Bot with notifications")
+    try:
+        backend = 'PostgreSQL' if getattr(db, 'is_postgres', lambda: False)() else 'SQLite'
+    except Exception:
+        backend = 'unknown'
+    logger.info("Starting Amazon Keepa Price Tracker Bot with notifications", db_backend=backend)
     
     app = Application.builder().token(config.bot_token).build()
     
@@ -717,6 +720,19 @@ def main() -> None:
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("remove", cmd_remove))
+    
+    # Debug DB command (temporary) to verify persistence
+    async def cmd_debugdb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await ensure_user_in_db(update)
+        user = update.effective_user
+        try:
+            from . import db as _db  # type: ignore
+        except Exception:
+            import db as _db  # type: ignore
+        cnt = _db.count_items_for_user(user.id)
+        backend = 'PostgreSQL' if getattr(_db, 'is_postgres', lambda: False)() else 'SQLite'
+        await update.message.reply_text(f"🔧 Debug DB\nBackend: {backend}\nActive items for you: {cnt}")
+    app.add_handler(CommandHandler("debugdb", cmd_debugdb))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_shared_link))
     
     # Unknown command handler (must be after known commands)

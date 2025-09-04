@@ -22,6 +22,8 @@ class Config:
     check_interval_minutes: int = int(os.getenv("CHECK_INTERVAL_MINUTES", "30"))
     # Storage
     database_path: str = os.getenv("DATABASE_PATH", "tracker.db")
+    database_url: str = os.getenv("DATABASE_URL", "")  # e.g. postgres://user:pass@host:5432/dbname
+    db_pool_size: int = int(os.getenv("DB_POOL_SIZE", "5"))
     # HTTP
     request_timeout_seconds: int = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "20"))
     user_agent: str = os.getenv("USER_AGENT", "Mozilla/5.0")
