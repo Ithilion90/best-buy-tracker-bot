@@ -1,16 +1,14 @@
-from typing import Dict, Tuple, Optional, List
+from typing import Dict, Tuple, Optional, List, Any
 import math
 import keepa  # type: ignore
 try:
     from .config import config
     from .logger import logger
     from .resilience import retry_with_backoff, circuit_breakers
-    from .cache import keepa_cache
 except ImportError:
     from config import config
     from logger import logger
     from resilience import retry_with_backoff, circuit_breakers
-    from cache import keepa_cache
 
 DomainMap = {
     "com": 1,
@@ -24,6 +22,70 @@ DomainMap = {
     "in": 10,
     "com.mx": 11,
 }
+
+def fetch_keepa_debug_data(asin: str, domain: Optional[str] = None) -> Dict[str, Any]:  # diagnostic utility
+    """Fetch raw Keepa product and expose parsing diagnostics for a single ASIN.
+    Returns a dict with keys: asin, domain, stats_min_raw, stats_max_raw, stats_current_raw,
+    parsed_min, parsed_max, parsed_current, history_min, history_max, sample_prices.
+    Performs a direct HTTP fetch to avoid stale anomalies."""
+    key = (getattr(config, "keepa_api_key", "") or "").strip()
+    if not key or not asin:
+        return {"error": "Missing key or ASIN"}
+    try:
+        import httpx
+        params = {
+            "key": key,
+            "domain": str(get_keepa_domain_id(domain)),
+            "asin": asin,
+            "stats": "1800",
+            "history": "1",
+        }
+        url = "https://api.keepa.com/product"
+        timeout = getattr(config, "request_timeout_seconds", 20) or 20
+        with httpx.Client(timeout=timeout) as client:
+            resp = client.get(url, params=params)
+            resp.raise_for_status()
+            data = resp.json()
+        products = data.get("products") or []
+        if not products:
+            return {"error": "No product data returned"}
+        p = products[0]
+        stats = p.get("stats", {}) or {}
+        # Raw stats (cents)
+        raw_min = stats.get("min")
+        raw_max = stats.get("max")
+        raw_current = stats.get("current")
+        # Use existing parser for final interpreted values
+        parsed = _parse_keepa_products_with_current([p])
+        parsed_min, parsed_max, parsed_current = parsed.get(asin, (None, None, None))
+        hmin, hmax = _minmax_from_history(p)
+        sample_prices: List[float] = []
+        csv0 = p.get("csv")[0] if isinstance(p.get("csv"), (list, tuple)) and p.get("csv") else None
+        if isinstance(csv0, (list, tuple)):
+            for idx, v in enumerate(csv0):
+                if len(sample_prices) >= 12:
+                    break
+                if idx % 2 == 1 and isinstance(v, (int, float)) and v > 0:
+                    sample_prices.append(round(v / 100.0, 2))
+        return {
+            "asin": asin,
+            "domain": domain or getattr(config, "keepa_domain", "com"),
+            "stats_min_raw": raw_min,
+            "stats_max_raw": raw_max,
+            "stats_current_raw": raw_current,
+            "parsed_min": parsed_min,
+            "parsed_max": parsed_max,
+            "parsed_current": parsed_current,
+            "history_min": round(hmin / 100.0, 2) if isinstance(hmin, (int, float)) and hmin > 0 else None,
+            "history_max": round(hmax / 100.0, 2) if isinstance(hmax, (int, float)) and hmax > 0 else None,
+            "sample_prices": sample_prices,
+        }
+    except Exception as e:  # pragma: no cover - diagnostic
+        try:
+            logger.warning("Keepa debug fetch failed", asin=asin, error=str(e))
+        except Exception:
+            pass
+        return {"error": str(e), "asin": asin}
 
 def _normalize_keepa_key(dom: Optional[str]) -> str:
     if not dom:
@@ -57,46 +119,19 @@ def get_keepa_domain_name(domain_override: Optional[str] = None) -> str:
 
 @retry_with_backoff(max_retries=3, exceptions=(Exception,))
 def fetch_lifetime_min_max_current(asin_list: List[str], domain: Optional[str] = None, force: bool = False) -> Dict[str, Tuple[Optional[float], Optional[float], Optional[float]]]:
-    """Return {asin: (min, max, current)} lifetime prices (Amazon price) in same currency.
-    Uses a 30 minute cache (1800s) to reduce API quota usage while keeping data reasonably fresh.
-    On error returns empty mapping or (None, None, None) entries so the caller can fallback.
-    """
+    """Return {asin: (min, max, current)} lifetime prices (always fetched fresh)."""
     key = (getattr(config, "keepa_api_key", "") or "").strip()
     if not key or not asin_list:
         return {}
-
-    # Check cache first (10 min TTL enforced when setting)
-    if not force:
-        cached = keepa_cache.get_lifetime_minmax_current(asin_list, domain=domain)
-        if cached is not None:
-            logger.info("Using cached Keepa current/min/max data", asins=len(asin_list), domain=domain)
-            return cached
-    else:
-        keepa_cache.invalidate_lifetime_minmax_current(asin_list, domain=domain)
-
-    logger.info("Fetching Keepa data with current prices (cache miss)", asins=len(asin_list), domain=domain or getattr(config, 'keepa_domain', 'com'))
-
     try:
         # Primary: keepa package
-        result = circuit_breakers['keepa_api'].call(_fetch_from_keepa_package_with_current, key, asin_list, domain)
-        if result:
-            keepa_cache.set_lifetime_minmax_current(asin_list, result, ttl=1800, domain=domain)  # 30 minutes
-            logger.info("Keepa current/min/max data fetched and cached", asins=len(asin_list), results=len(result), ttl_seconds=1800, domain=domain)
-        return result
+        return circuit_breakers['keepa_api'].call(_fetch_from_keepa_package_with_current, key, asin_list, domain)
     except ImportError:
-        # Fallback: pykeepa
         try:
-            result = _fetch_from_pykeepa_with_current(key, asin_list, domain)
-            if result:
-                keepa_cache.set_lifetime_minmax_current(asin_list, result, ttl=1800, domain=domain)
-            return result
+            return _fetch_from_pykeepa_with_current(key, asin_list, domain)
         except ImportError:
-            # Final fallback: raw HTTP
             try:
-                result = circuit_breakers['keepa_api'].call(_fetch_via_http_with_current, asin_list, key, domain)
-                if result:
-                    keepa_cache.set_lifetime_minmax_current(asin_list, result, ttl=1800, domain=domain)
-                return result
+                return circuit_breakers['keepa_api'].call(_fetch_via_http_with_current, asin_list, key, domain)
             except Exception as e:
                 logger.error("All Keepa methods failed", error=str(e))
                 return {asin: (None, None, None) for asin in asin_list}
@@ -106,47 +141,24 @@ def fetch_lifetime_min_max_current(asin_list: List[str], domain: Optional[str] =
 
 @retry_with_backoff(max_retries=3, exceptions=(Exception,))
 def fetch_lifetime_min_max(asin_list: List[str], domain: Optional[str] = None, force: bool = False) -> Dict[str, Tuple[Optional[float], Optional[float]]]:
-    """Return {asin: (min, max)} lifetime (price type: Amazon price) in same currency.
-    Requires KEEPA_API_KEY in config; on error returns {} or missing keys.
-    If Keepa doesn't have historical data, returns (None, None) so caller can use DB fallback.
-    Uses caching and circuit breaker for resilience.
-    """
+    """Return {asin: (min, max)} lifetime prices (fresh fetch)."""
     key = (getattr(config, "keepa_api_key", "") or "").strip()
     if not key or not asin_list:
         return {}
-    
-    # Check cache first
-    if not force:
-        cached_result = keepa_cache.get_lifetime_minmax(asin_list, domain=domain)
-        if cached_result is not None:
-            logger.info("Using cached Keepa data", asins=len(asin_list), domain=domain)
-            return cached_result
-    else:
-        keepa_cache.invalidate_lifetime_minmax(asin_list, domain=domain)
-    
     try:
-        # Try with 'keepa' package first using circuit breaker
-        result = circuit_breakers['keepa_api'].call(_fetch_from_keepa_package, key, asin_list, domain)
+        return circuit_breakers['keepa_api'].call(_fetch_from_keepa_package, key, asin_list, domain)
     except ImportError:
-        # Fallback: try pykeepa
         try:
-            result = _fetch_from_pykeepa(key, asin_list, domain)
+            return _fetch_from_pykeepa(key, asin_list, domain)
         except ImportError:
-            # Final fallback: HTTP API
             try:
-                result = circuit_breakers['keepa_api'].call(_fetch_via_http, asin_list, key, domain)
+                return circuit_breakers['keepa_api'].call(_fetch_via_http, asin_list, key, domain)
             except Exception as e:
                 logger.error("All Keepa methods failed", error=str(e))
                 return {asin: (None, None) for asin in asin_list}
     except Exception as e:
         logger.error("Keepa API failed", error=str(e), asins=len(asin_list))
         return {asin: (None, None) for asin in asin_list}
-
-    # Cache successful result if any
-    if result:
-        keepa_cache.set_lifetime_minmax(asin_list, result, domain=domain)
-        logger.info("Keepa data fetched and cached", asins=len(asin_list), results=len(result))
-    return result
 
 def _fetch_from_keepa_package_with_current(key: str, asin_list: List[str], domain: Optional[str]) -> Dict[str, Tuple[Optional[float], Optional[float], Optional[float]]]:
     """Fetch from keepa package with current prices"""
