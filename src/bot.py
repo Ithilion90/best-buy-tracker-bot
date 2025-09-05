@@ -107,7 +107,7 @@ def extract_domain(url: str) -> Optional[str]:
     except Exception:
         return None
 
-async def send_price_notification(user_id: int, asin: str, title: str, old_price: float, new_price: float, min_price: float, app: Application, domain: str | None = None, currency: str | None = None) -> None:
+async def send_price_notification(user_id: int, asin: str, title: str, old_price: float, new_price: float, min_price: float, max_price: float, app: Application, domain: str | None = None, currency: str | None = None) -> None:
     """Send price notification to user (domain-aware, multi-currency)."""
     try:
         dom = domain or 'amazon.it'
@@ -118,25 +118,27 @@ async def send_price_notification(user_id: int, asin: str, title: str, old_price
         # Determine currency (priority: provided currency -> domain mapping)
         curr = currency or domain_to_currency(dom)
         is_historical_min = abs(new_price - min_price) < 0.01 if min_price is not None else False
-        hist_line = f"🏷️ <b>Historical Min:</b> {format_price(min_price, curr)}" if min_price is not None else ""
+        hist_line = f"📉 <b>Historical Min:</b> {format_price(min_price, curr)}" if min_price is not None else ""
         if is_historical_min:
             message = (
                 f"🔥 <b>HISTORICAL MINIMUM!</b> 🔥\n\n"
                 f"📦 {clickable_title}\n\n"
                 f"💰 <b>New Price:</b> {format_price(new_price, curr)}\n"
-                f"📉 <b>Previous:</b> {format_price(old_price, curr)}\n"
-                f"💡 <b>Savings:</b> {format_price(old_price - new_price, curr)}\n"
-                f"{hist_line}\n\n"
+                f"🏷️ <b>Previous:</b> {format_price(old_price, curr)}\n"
+                #f"💡 <b>Savings:</b> {format_price(old_price - new_price, curr)}\n"
+                f"{hist_line}\n"
+                f"📈 <b>Historical Max:</b> {format_price(max_price, curr)}\n\n"
                 f"🎯 <b>This is the lowest price ever recorded!</b>"
             )
         else:
             message = (
-                f"📉 <b>Price Drop Alert!</b>\n\n"
+                f"💡 <b>Price Drop Alert!</b>\n\n"
                 f"📦 {clickable_title}\n\n"
                 f"💰 <b>New Price:</b> {format_price(new_price, curr)}\n"
-                f"📈 <b>Previous:</b> {format_price(old_price, curr)}\n"
-                f"💡 <b>Savings:</b> {format_price(old_price - new_price, curr)}\n"
-                f"{hist_line}"
+                f"🏷️ <b>Previous:</b> {format_price(old_price, curr)}\n"
+                #f"💡 <b>Savings:</b> {format_price(old_price - new_price, curr)}\n"
+                f"{hist_line}\n"
+                f"📈 <b>Historical Max:</b> {format_price(max_price, curr)}"
             )
 
         # Try to fetch image (scrape on-demand). Not cached to keep simple (caching would be feature 2).
@@ -260,6 +262,7 @@ async def refresh_prices_and_notify(app: Application) -> None:
                                 old_price,
                                 current_price,
                                 adj_min,
+                                adj_max,
                                 app,
                                 domain=dom,
                             )
@@ -406,8 +409,8 @@ async def handle_shared_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 f"{clickable_title_existing}\n"
                 f"🌍 <b>Domain:</b> {domain_disp}\n"
                 f"💰 <b>Current:</b> {format_price(current_display, curr)}\n"
-                f"📉 <b>Min:</b> {format_price(min_display, curr)}\n"
-                f"📈 <b>Max:</b> {format_price(max_display, curr)}\n\n"
+                f"📉 <b>Historical Min:</b> {format_price(min_display, curr)}\n"
+                f"📈 <b>Historical Max:</b> {format_price(max_display, curr)}\n\n"
                 "Use /list to view all products.",
                 parse_mode="HTML",
                 disable_web_page_preview=True
@@ -485,8 +488,8 @@ async def handle_shared_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
             f"✅ <b>Product Added!</b>\n\n"
             f"📦 {clickable_title}\n"
             f"💰 <b>Current Price:</b> {format_price(current_price, curr_added)}\n"
-            f"📉 <b>Min Price:</b> {format_price(corrected_min, curr_added)}\n"
-            f"📈 <b>Max Price:</b> {format_price(corrected_max, curr_added)}\n\n"
+            f"📉 <b>Historical Min:</b> {format_price(corrected_min, curr_added)}\n"
+            f"📈 <b>Historical Max:</b> {format_price(corrected_max, curr_added)}\n\n"
             f"📢 <b>You'll be notified when the price change!</b>"
         )
 
@@ -578,8 +581,8 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             line = f"{i}. {clickable}\n"
             line += f"   🌍 <b>Domain:</b> {dom or 'n/a'}\n"
             line += f"   💰 <b>Current:</b> {format_price(cur_p, curr_row)}\n"
-            line += f"   📉 <b>Min:</b> {format_price(min_p, curr_row)}\n"
-            line += f"   📈 <b>Max:</b> {format_price(max_p, curr_row)}"
+            line += f"   📉 <b>Historical Min:</b> {format_price(min_p, curr_row)}\n"
+            line += f"   📈 <b>Historical Max:</b> {format_price(max_p, curr_row)}"
             lines.append(line)
         if len(lines) == 1:
             spinner_stop.set()
