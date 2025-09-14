@@ -144,12 +144,62 @@ def extract_title_price_image(html: str):
 
     return title, price, currency, image_url
 
+def extract_availability(html: str) -> Optional[str]:
+    """Very simple availability detector across major locales.
+    Returns one of: 'in_stock', 'unavailable', 'preorder', 'unknown'.
+    """
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        text = soup.get_text(" ", strip=True).lower()
+        # Common OOS strings in various locales
+        oos_markers = [
+            "currently unavailable",  # en
+            "temporarily out of stock",  # en
+            "out of stock",  # en
+            "non disponibile",  # it
+            "momentaneamente non disponibile",  # it
+            "attualmente non disponibile",  # it
+            "actuellement indisponible",  # fr
+            "article indisponible",  # fr
+            "derzeit nicht verfügbar",  # de
+            "derzeit nicht auf lager",  # de
+            "agotado temporalmente",  # es
+            "no disponible",  # es
+            "在庫切れ",  # jp
+        ]
+        preorder_markers = [
+            "pre-order", "preorder", "pre-ordine", "précommande", "vorbestellen", "preventa"
+        ]
+        # If "Add to Cart" exists it's likely in stock
+        in_stock_markers = [
+            "add to cart", "aggiungi al carrello", "ajouter au panier", "in den einkaufswagen", "añadir a la cesta"
+        ]
+        if any(m in text for m in oos_markers):
+            return "unavailable"
+        if any(m in text for m in preorder_markers):
+            return "preorder"
+        if any(m in text for m in in_stock_markers):
+            return "in_stock"
+        return "unknown"
+    except Exception:
+        return None
+
 async def fetch_price_title_image(url: str):
     async with httpx.AsyncClient(follow_redirects=True) as client:
         html = await fetch_html(client, url)
         if not html:
             return None, None, None, None
         return extract_title_price_image(html)
+
+async def fetch_price_title_image_and_availability(url: str):
+    """Return (title, price, currency, image_url, availability)."""
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        html = await fetch_html(client, url)
+        if not html:
+            return None, None, None, None, None
+        title, price, currency, image = extract_title_price_image(html)
+        availability = extract_availability(html)
+        return title, price, currency, image, availability
 
 async def get_scraped_current_price(url: str, asin: str):
     """Return (title, price, currency) scraping live (no cache)."""

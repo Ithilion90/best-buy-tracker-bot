@@ -151,6 +151,11 @@ def _init_db_postgres(conn):  # pragma: no cover (not hit in SQLite tests)
             is_active BOOLEAN DEFAULT TRUE
         )
     """)
+    # Ensure new columns exist
+    try:
+        cur.execute("ALTER TABLE items ADD COLUMN IF NOT EXISTS availability TEXT")
+    except Exception:
+        pass
     # Price history
     cur.execute("""
         CREATE TABLE IF NOT EXISTS price_history (
@@ -240,6 +245,7 @@ def _create_fresh_schema(conn):
             category TEXT,
             priority INTEGER DEFAULT 1,
             is_active BOOLEAN DEFAULT 1,
+            availability TEXT,
             FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
         )
     """)
@@ -295,8 +301,9 @@ def _migrate_existing_schema(conn):
         'notification_sent_at': 'TIMESTAMP',
         'category': 'TEXT',
         'priority': 'INTEGER DEFAULT 1',
-        'is_active': 'BOOLEAN DEFAULT 1',
-        'domain': 'TEXT'
+    'is_active': 'BOOLEAN DEFAULT 1',
+    'domain': 'TEXT',
+    'availability': 'TEXT'
     }
     
     for column_name, column_def in new_columns.items():
@@ -478,7 +485,7 @@ def get_item_by_user_and_asin(user_id: int, asin: str, domain: Optional[str] = N
             return dict(row) if row else None
 
 def update_price(item_id: int, new_price: Optional[float], new_currency: str = None, new_title: str = None, availability: str = 'in_stock') -> None:
-    """Update item price with enhanced tracking"""
+    """Update item price with enhanced tracking and availability persistence."""
     with get_db_connection() as conn:
         if _is_postgres:
             cur = conn.cursor()
@@ -512,6 +519,9 @@ def update_price(item_id: int, new_price: Optional[float], new_currency: str = N
             if new_title:
                 set_parts.append("title = %s")
                 vals.append(new_title)
+            if availability:
+                set_parts.append("availability = %s")
+                vals.append(availability)
             vals.append(item_id)
             cur.execute(f"UPDATE items SET {', '.join(set_parts)} WHERE id = %s", vals)
             if new_price is not None:
@@ -547,14 +557,32 @@ def update_price(item_id: int, new_price: Optional[float], new_currency: str = N
             if new_title:
                 update_fields.append("title = ?")
                 update_values.append(new_title)
+            if availability:
+                update_fields.append("availability = ?")
+                update_values.append(availability)
             update_values.append(item_id)
             conn.execute(f"UPDATE items SET {', '.join(update_fields)} WHERE id = ?", update_values)
             if new_price is not None:
                 conn.execute("INSERT INTO price_history (item_id, price, currency, source, availability) VALUES (?, ?, ?, 'scraping', ?)", (item_id, new_price, new_currency or item['currency'], availability))
-            # Build metadata JSON string safely using concatenation (SQLite)
             conn.execute('INSERT INTO system_metrics (metric_name, metric_value, metadata) VALUES ("price_check", 1, "{" || "\"item_id\": " || ? || "}")', (item_id,))
             conn.commit()
             logger.info("Price updated", item_id=item_id, old_price=item['last_price'], new_price=new_price, savings=savings)
+
+def update_item_availability(item_id: int, availability: str) -> None:
+    """Update availability field on items table independently of price updates."""
+    if not availability:
+        return
+    with get_db_connection() as conn:
+        try:
+            if _is_postgres:
+                cur = conn.cursor()
+                cur.execute("UPDATE items SET availability = %s, updated_at = NOW() WHERE id = %s", (availability, item_id))
+                conn.commit()
+            else:
+                conn.execute("UPDATE items SET availability = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (availability, item_id))
+                conn.commit()
+        except Exception as e:
+            logger.warning("Failed to update item availability", item_id=item_id, availability=availability, error=str(e))
 
 def remove_item(user_id: int, item_id: int) -> bool:
     """Remove item with stats update"""
@@ -611,6 +639,21 @@ def update_item_price(item_id: int, new_price: float) -> None:
         else:
             conn.execute("UPDATE items SET last_price = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (new_price, item_id))
             conn.commit()
+    def update_item_availability(item_id: int, availability: str) -> None:
+        """Update availability field on items table independently of price updates."""
+        if not availability:
+            return
+        with get_db_connection() as conn:
+            try:
+                if _is_postgres:
+                    cur = conn.cursor()
+                    cur.execute("UPDATE items SET availability = %s, updated_at = NOW() WHERE id = %s", (availability, item_id))
+                    conn.commit()
+                else:
+                    conn.execute("UPDATE items SET availability = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (availability, item_id))
+                    conn.commit()
+            except Exception as e:
+                logger.warning("Failed to update item availability", item_id=item_id, availability=availability, error=str(e))
 
 def update_price_bounds(item_id: int, new_min: float, new_max: float) -> None:
     """Update only min and max prices without changing current price"""

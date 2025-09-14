@@ -1,0 +1,16 @@
+.venv
+.venv311
+__pycache__
+*.pyc
+.pytest_cache
+.mypy_cache
+.DS_Store
+tracker.db
+logs/
+BestBuyTrackerBot.spec
+dist/
+build/
+*.log
+.env
+*.sqlite
+*.db

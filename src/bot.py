@@ -202,11 +202,16 @@ async def refresh_prices_and_notify(app: Application) -> None:
         async def scrape(asin: str, url: str):
             async with sem:
                 try:
-                    title_s, price_s, _c, _img = await fetch_price_title_image(url)
-                    return asin, title_s, price_s
+                    # Prefer function that also returns availability if present
+                    try:
+                        from src.price_fetcher import fetch_price_title_image_and_availability  # type: ignore
+                    except ImportError:
+                        from price_fetcher import fetch_price_title_image_and_availability  # type: ignore
+                    title_s, price_s, _c, _img, avail = await fetch_price_title_image_and_availability(url)
+                    return asin, title_s, price_s, avail
                 except Exception as e:
                     logger.warning("Refresh scrape failed", asin=asin, error=str(e))
-                    return asin, None, None
+                    return asin, None, None, None
 
         updated_items = 0
         for dom, asin_map in domain_group.items():
@@ -214,14 +219,14 @@ async def refresh_prices_and_notify(app: Application) -> None:
             keepa_bounds_dom = fetch_lifetime_min_max_current(asins_dom, domain=dom)
             # Scrape concurrently (first URL per asin)
             tasks = [scrape(a, lst[0].get('url')) for a, lst in asin_map.items() if lst and lst[0].get('url')]
-            scrape_results: dict[str, tuple[str | None, float | None]] = {}
+            scrape_results: dict[str, tuple[str | None, float | None, str | None]] = {}
             if tasks:
-                for asin, t, p in await asyncio.gather(*tasks):
-                    scrape_results[asin] = (t, p)
+                for asin, t, p, a in await asyncio.gather(*tasks):
+                    scrape_results[asin] = (t, p, a)
 
             for asin, lst in asin_map.items():
                 k_min, k_max, k_cur = keepa_bounds_dom.get(asin, (None, None, None)) if keepa_bounds_dom else (None, None, None)
-                scraped_title, scraped_price = scrape_results.get(asin, (None, None))
+                scraped_title, scraped_price, scraped_avail = scrape_results.get(asin, (None, None, None))
 
                 # Fallback if keepa missing
                 if k_min is None or k_max is None:
@@ -243,7 +248,7 @@ async def refresh_prices_and_notify(app: Application) -> None:
                     old_price = item.get('last_price')
                     try:
                         db.update_price_bounds(item['id'], adj_min, adj_max)
-                        db.update_price(item['id'], current_price)
+                        db.update_price(item['id'], current_price, availability=(scraped_avail or 'in_stock'))
                     except Exception as e:
                         logger.warning("Refresh DB update failed", item_id=item['id'], error=str(e))
                     # Notification logic
@@ -419,7 +424,12 @@ async def handle_shared_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
             return
 
         # Get product title, current price and image (use resolved URL) - sequential original flow
-        title, current_price, currency, image_url = await fetch_price_title_image(url)
+        # Prefer scraper that returns availability
+        try:
+            from src.price_fetcher import fetch_price_title_image_and_availability  # type: ignore
+        except ImportError:
+            from price_fetcher import fetch_price_title_image_and_availability  # type: ignore
+        title, current_price, currency, image_url, availability = await fetch_price_title_image_and_availability(url)
         if not title:
             title = f"Amazon Product {asin}"
 
@@ -503,6 +513,12 @@ async def handle_shared_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
             currency=currency or "EUR",
             price=current_price
         )
+        # store availability immediately
+        try:
+            if availability:
+                db.update_item_availability(item_id, availability)
+        except Exception:
+            pass
         # Immediately correct stored min/max in DB to the historical bounds we just displayed
         try:
             if (corrected_min is not None and corrected_max is not None and
@@ -578,9 +594,23 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             aff_url = with_affiliate(r['url'])
             clickable = f"<a href=\"{aff_url}\">{title_disp}</a>"
             curr_row = r.get('currency') or domain_to_currency(dom)
+            avail = (r.get('availability') or '').lower()
+            if avail == 'unavailable':
+                stock_line = "❌ Not available"
+            elif avail == 'preorder':
+                stock_line = "🕒 Pre-order"
+            elif avail == 'in_stock':
+                stock_line = "✅ In stock"
+            elif avail:
+                stock_line = f"ℹ️ {avail}"
+            else:
+                stock_line = ""
             line = f"{i}. {clickable}\n"
             line += f"   🌍 <b>Domain:</b> {dom or 'n/a'}\n"
-            line += f"   💰 <b>Current:</b> {format_price(cur_p, curr_row)}\n"
+            if stock_line:
+                line += f"   📦 <b>Status:</b> {stock_line}\n"
+            if avail != 'unavailable':
+                line += f"   💰 <b>Current:</b> {format_price(cur_p, curr_row)}\n"
             line += f"   📉 <b>Historical Min:</b> {format_price(min_p, curr_row)}\n"
             line += f"   📈 <b>Historical Max:</b> {format_price(max_p, curr_row)}"
             lines.append(line)
