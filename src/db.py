@@ -484,7 +484,7 @@ def get_item_by_user_and_asin(user_id: int, asin: str, domain: Optional[str] = N
                 row = conn.execute("SELECT * FROM items WHERE user_id = ? AND asin = ? AND is_active = 1 LIMIT 1", (user_id, asin)).fetchone()
             return dict(row) if row else None
 
-def update_price(item_id: int, new_price: Optional[float], new_currency: str = None, new_title: str = None, availability: str = 'in_stock') -> None:
+def update_price(item_id: int, new_price: Optional[float], new_currency: str = None, new_title: str = None, availability: Optional[str] = None) -> None:
     """Update item price with enhanced tracking and availability persistence."""
     with get_db_connection() as conn:
         if _is_postgres:
@@ -519,7 +519,7 @@ def update_price(item_id: int, new_price: Optional[float], new_currency: str = N
             if new_title:
                 set_parts.append("title = %s")
                 vals.append(new_title)
-            if availability:
+            if availability is not None and availability != '':
                 set_parts.append("availability = %s")
                 vals.append(availability)
             vals.append(item_id)
@@ -557,7 +557,7 @@ def update_price(item_id: int, new_price: Optional[float], new_currency: str = N
             if new_title:
                 update_fields.append("title = ?")
                 update_values.append(new_title)
-            if availability:
+            if availability is not None and availability != '':
                 update_fields.append("availability = ?")
                 update_values.append(availability)
             update_values.append(item_id)

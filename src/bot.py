@@ -2,6 +2,7 @@
 import time
 import re
 import asyncio
+import os
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
@@ -207,11 +208,11 @@ async def refresh_prices_and_notify(app: Application) -> None:
                         from src.price_fetcher import fetch_price_title_image_and_availability  # type: ignore
                     except ImportError:
                         from price_fetcher import fetch_price_title_image_and_availability  # type: ignore
-                    title_s, price_s, _c, _img, avail = await fetch_price_title_image_and_availability(url)
-                    return asin, title_s, price_s, avail
+                    title_s, price_s, currency_s, _img, avail = await fetch_price_title_image_and_availability(url)
+                    return asin, title_s, price_s, currency_s, avail
                 except Exception as e:
                     logger.warning("Refresh scrape failed", asin=asin, error=str(e))
-                    return asin, None, None, None
+                    return asin, None, None, None, None
 
         updated_items = 0
         for dom, asin_map in domain_group.items():
@@ -219,14 +220,28 @@ async def refresh_prices_and_notify(app: Application) -> None:
             keepa_bounds_dom = fetch_lifetime_min_max_current(asins_dom, domain=dom)
             # Scrape concurrently (first URL per asin)
             tasks = [scrape(a, lst[0].get('url')) for a, lst in asin_map.items() if lst and lst[0].get('url')]
-            scrape_results: dict[str, tuple[str | None, float | None, str | None]] = {}
+            scrape_results: dict[str, tuple[str | None, float | None, str | None, str | None]] = {}
             if tasks:
-                for asin, t, p, a in await asyncio.gather(*tasks):
-                    scrape_results[asin] = (t, p, a)
+                for asin, t, p, c, a in await asyncio.gather(*tasks):
+                    scrape_results[asin] = (t, p, c, a)
 
             for asin, lst in asin_map.items():
                 k_min, k_max, k_cur = keepa_bounds_dom.get(asin, (None, None, None)) if keepa_bounds_dom else (None, None, None)
-                scraped_title, scraped_price, scraped_avail = scrape_results.get(asin, (None, None, None))
+                scraped_title, scraped_price, scraped_currency, scraped_avail = scrape_results.get(asin, (None, None, None, None))
+                
+                # Validate scraped price currency matches expected domain currency
+                expected_currency = domain_to_currency(dom)
+                if scraped_price is not None and scraped_currency and scraped_currency != expected_currency:
+                    logger.warning(
+                        "Scraped currency mismatch - discarding scraped price",
+                        asin=asin,
+                        domain=dom,
+                        expected=expected_currency,
+                        got=scraped_currency,
+                        price=scraped_price
+                    )
+                    # Discard scraped price if currency doesn't match
+                    scraped_price = None
 
                 # Fallback if keepa missing
                 if k_min is None or k_max is None:
@@ -246,9 +261,14 @@ async def refresh_prices_and_notify(app: Application) -> None:
 
                 for item in lst:
                     old_price = item.get('last_price')
+                    # Decide availability to persist with Keepa-first policy
+                    to_avail = None
+                    # Persist only explicit availability from scraper; do not infer in-stock from prices
+                    if scraped_avail in ('unavailable', 'preorder', 'in_stock'):
+                        to_avail = scraped_avail
                     try:
                         db.update_price_bounds(item['id'], adj_min, adj_max)
-                        db.update_price(item['id'], current_price, availability=(scraped_avail or 'in_stock'))
+                        db.update_price(item['id'], current_price, availability=to_avail)
                     except Exception as e:
                         logger.warning("Refresh DB update failed", item_id=item['id'], error=str(e))
                     # Notification logic
@@ -295,6 +315,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/list — Show tracked products with prices\n"
         "/remove &lt;number&gt; — Remove specific product\n"
         "/remove all — Remove all tracked products\n"
+        "/debugprice &lt;number&gt; — Debug price detection\n"
         "/help — Show this guide\n\n"
         "💡 <b>Tip:</b> Share an Amazon link to add it automatically!\n"
         "📢 <b>Notifications:</b> You'll be alerted when prices drop!",
@@ -609,7 +630,12 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             line += f"   🌍 <b>Domain:</b> {dom or 'n/a'}\n"
             if stock_line:
                 line += f"   📦 <b>Status:</b> {stock_line}\n"
-            if avail != 'unavailable':
+            show_preorder_price = os.getenv('SHOW_PRICE_WHEN_PREORDER', 'true').lower() in ('1', 'true', 'yes', 'y')
+            if avail == 'unavailable':
+                pass
+            elif avail == 'preorder' and not show_preorder_price:
+                pass
+            else:
                 line += f"   💰 <b>Current:</b> {format_price(cur_p, curr_row)}\n"
             line += f"   📉 <b>Historical Min:</b> {format_price(min_p, curr_row)}\n"
             line += f"   📈 <b>Historical Max:</b> {format_price(max_p, curr_row)}"
@@ -835,6 +861,65 @@ def main() -> None:
             pass
         await update.message.reply_text("\n".join(msg_lines))
     app.add_handler(CommandHandler("debugasin", cmd_debugasin))
+    
+    # /debugprice <number> command to inspect all prices on product page
+    async def cmd_debugprice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await ensure_user_in_db(update)
+        user = update.effective_user
+        if not context.args:
+            await update.message.reply_text("Usage: /debugprice <number>\n\nUse /list to see product numbers")
+            return
+        try:
+            index = int(context.args[0]) - 1
+        except ValueError:
+            await update.message.reply_text("❌ Invalid number. Use /debugprice <number>")
+            return
+        
+        rows = db.list_items(user.id)
+        if index < 0 or index >= len(rows):
+            await update.message.reply_text("❌ Invalid product number. Use /list to see available products.")
+            return
+        
+        item = rows[index]
+        url = item.get('url')
+        if not url:
+            await update.message.reply_text("❌ No URL found for this product")
+            return
+        
+        msg = await update.message.reply_text("🔍 Analyzing prices on product page...")
+        
+        try:
+            from src.price_fetcher import fetch_price_debug  # type: ignore
+        except ImportError:
+            from price_fetcher import fetch_price_debug  # type: ignore
+        
+        debug_info = await fetch_price_debug(url)
+        
+        if not debug_info:
+            await msg.edit_text("❌ Failed to fetch page. Check URL or try again.")
+            return
+        
+        lines = [f"🔍 <b>Price Debug: {item.get('title', 'Product')[:40]}</b>\n"]
+        lines.append(f"<b>Selected Price:</b> {debug_info['selected_price'] or 'None'}")
+        lines.append(f"<b>Source:</b> {debug_info['selected_source'] or 'None'}\n")
+        
+        if debug_info['primary_selectors']:
+            lines.append("<b>Primary Selectors Found:</b>")
+            for name, price in debug_info['primary_selectors'].items():
+                lines.append(f"  • {name}: {price}")
+            lines.append("")
+        
+        if debug_info['all_offscreen']:
+            lines.append(f"<b>All Offscreen Prices ({len(debug_info['all_offscreen'])}):</b>")
+            for i, item_price in enumerate(debug_info['all_offscreen'][:10], 1):
+                coupon_flag = " [COUPON]" if item_price['is_coupon'] else ""
+                lines.append(f"  {i}. {item_price['text']}{coupon_flag}")
+            if len(debug_info['all_offscreen']) > 10:
+                lines.append(f"  ... and {len(debug_info['all_offscreen']) - 10} more")
+        
+        await msg.edit_text("\n".join(lines), parse_mode="HTML")
+    
+    app.add_handler(CommandHandler("debugprice", cmd_debugprice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_shared_link))
     
     # Unknown command handler (must be after known commands)

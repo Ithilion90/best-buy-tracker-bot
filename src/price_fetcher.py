@@ -75,9 +75,12 @@ def extract_title_price_image(html: str):
             break
 
     price_text = None
+    # Priority order: prefer actual Amazon price over coupon/deal prices
+    # 1. Try main price block (excludes coupon badges)
     for sel in [
-        "span.a-offscreen",
-        "#corePrice_feature_div span.a-price span.a-offscreen",
+        "#corePrice_feature_div .a-price[data-a-color='price'] span.a-offscreen",
+        "#corePrice_feature_div .a-price.a-text-price span.a-offscreen",
+        "#apex_desktop .a-price[data-a-color='price'] span.a-offscreen",
         "#priceblock_ourprice",
         "#priceblock_dealprice",
         "#priceblock_saleprice",
@@ -86,6 +89,22 @@ def extract_title_price_image(html: str):
         if el and el.get_text(strip=True):
             price_text = el.get_text(strip=True)
             break
+    
+    # 2. Fallback: any offscreen price (may include coupons)
+    if not price_text:
+        offscreen_prices = soup.select("span.a-offscreen")
+        for el in offscreen_prices:
+            text = el.get_text(strip=True)
+            # Skip if parent has coupon/badge indicators
+            parent = el.parent
+            if parent:
+                parent_class = ' '.join(parent.get('class', []))
+                # Skip coupon badges and promotional elements
+                if any(x in parent_class.lower() for x in ['coupon', 'badge', 'promotion', 'promo']):
+                    continue
+            if text:
+                price_text = text
+                break
 
     price = None
     currency = None
@@ -144,42 +163,112 @@ def extract_title_price_image(html: str):
 
     return title, price, currency, image_url
 
+def extract_all_prices_debug(html: str) -> dict:
+    """Extract all prices found on page for debugging purposes.
+    Returns dict with all prices and which one was selected."""
+    soup = BeautifulSoup(html, "html.parser")
+    
+    debug_info = {
+        'all_offscreen': [],
+        'primary_selectors': {},
+        'selected_price': None,
+        'selected_source': None
+    }
+    
+    # Collect all offscreen prices
+    for el in soup.select("span.a-offscreen"):
+        text = el.get_text(strip=True)
+        parent = el.parent
+        parent_class = ' '.join(parent.get('class', [])) if parent else ''
+        is_coupon = any(x in parent_class.lower() for x in ['coupon', 'badge', 'promotion', 'promo'])
+        debug_info['all_offscreen'].append({
+            'text': text,
+            'parent_class': parent_class,
+            'is_coupon': is_coupon
+        })
+    
+    # Try primary selectors
+    primary_sels = [
+        ("#corePrice_feature_div .a-price[data-a-color='price'] span.a-offscreen", "corePrice main"),
+        ("#corePrice_feature_div .a-price.a-text-price span.a-offscreen", "corePrice text"),
+        ("#apex_desktop .a-price[data-a-color='price'] span.a-offscreen", "apex desktop"),
+        ("#priceblock_ourprice", "priceblock_ourprice"),
+        ("#priceblock_dealprice", "priceblock_dealprice"),
+        ("#priceblock_saleprice", "priceblock_saleprice"),
+    ]
+    
+    for sel, name in primary_sels:
+        el = soup.select_one(sel)
+        if el:
+            text = el.get_text(strip=True)
+            debug_info['primary_selectors'][name] = text
+            if not debug_info['selected_price']:
+                debug_info['selected_price'] = text
+                debug_info['selected_source'] = name
+    
+    # If no primary selector worked, use fallback
+    if not debug_info['selected_price']:
+        for item in debug_info['all_offscreen']:
+            if not item['is_coupon'] and item['text']:
+                debug_info['selected_price'] = item['text']
+                debug_info['selected_source'] = 'fallback_offscreen'
+                break
+    
+    return debug_info
+
 def extract_availability(html: str) -> Optional[str]:
-    """Very simple availability detector across major locales.
-    Returns one of: 'in_stock', 'unavailable', 'preorder', 'unknown'.
+    """Availability detection prioritizing Amazon DOM over page-wide text.
+    Returns: 'in_stock' | 'unavailable' | 'preorder' | 'unknown'.
     """
     try:
         soup = BeautifulSoup(html, "html.parser")
-        text = soup.get_text(" ", strip=True).lower()
-        # Common OOS strings in various locales
-        oos_markers = [
-            "currently unavailable",  # en
-            "temporarily out of stock",  # en
-            "out of stock",  # en
-            "non disponibile",  # it
-            "momentaneamente non disponibile",  # it
-            "attualmente non disponibile",  # it
-            "actuellement indisponible",  # fr
-            "article indisponible",  # fr
-            "derzeit nicht verfügbar",  # de
-            "derzeit nicht auf lager",  # de
-            "agotado temporalmente",  # es
-            "no disponible",  # es
-            "在庫切れ",  # jp
-        ]
-        preorder_markers = [
-            "pre-order", "preorder", "pre-ordine", "précommande", "vorbestellen", "preventa"
-        ]
-        # If "Add to Cart" exists it's likely in stock
-        in_stock_markers = [
-            "add to cart", "aggiungi al carrello", "ajouter au panier", "in den einkaufswagen", "añadir a la cesta"
-        ]
-        if any(m in text for m in oos_markers):
-            return "unavailable"
-        if any(m in text for m in preorder_markers):
-            return "preorder"
-        if any(m in text for m in in_stock_markers):
+        # Check availability block first
+        avail_el = soup.select_one('#availability, span#availability, div#availability span')
+        if avail_el:
+            ab_text = avail_el.get_text(" ", strip=True).lower()
+            if any(x in ab_text for x in [
+                "currently unavailable", "temporarily out of stock", "out of stock",
+                "non disponibile", "momentaneamente non disponibile", "attualmente non disponibile",
+                "actuellement indisponible", "article indisponible",
+                "derzeit nicht verfügbar", "derzeit nicht auf lager",
+                "agotado", "no disponible", "在庫切れ"
+            ]):
+                return "unavailable"
+            if any(x in ab_text for x in [
+                "pre-order", "preorder", "pre-ordine", "précommande", "vorbestellen", "preventa"
+            ]):
+                return "preorder"
+            if any(x in ab_text for x in [
+                "in stock", "disponibile", "en stock", "auf lager", "disponible"
+            ]):
+                return "in_stock"
+
+        # Check buttons presence and disabled state
+        add_btn = soup.select_one('#add-to-cart-button, input#add-to-cart-button')
+        buy_btn = soup.select_one('#buy-now-button, input#buy-now-button')
+        def _is_enabled(btn):
+            if not btn:
+                return False
+            if btn.has_attr('disabled'):
+                return False
+            parent = btn.parent
+            # disabled style on wrapper
+            if parent and 'a-button-disabled' in (parent.get('class') or []):
+                return False
+            return True
+        if _is_enabled(add_btn) or _is_enabled(buy_btn):
             return "in_stock"
+
+        # Fallback: page text explicit OOS
+        text = soup.get_text(" ", strip=True).lower()
+        if any(x in text for x in [
+            "currently unavailable", "temporarily out of stock", "out of stock",
+            "non disponibile", "momentaneamente non disponibile", "attualmente non disponibile",
+            "actuellement indisponible", "article indisponible",
+            "derzeit nicht verfügbar", "derzeit nicht auf lager",
+            "agotado", "no disponible", "在庫切れ"
+        ]):
+            return "unavailable"
         return "unknown"
     except Exception:
         return None
@@ -200,6 +289,14 @@ async def fetch_price_title_image_and_availability(url: str):
         title, price, currency, image = extract_title_price_image(html)
         availability = extract_availability(html)
         return title, price, currency, image, availability
+
+async def fetch_price_debug(url: str):
+    """Return debug info about all prices found on the page."""
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        html = await fetch_html(client, url)
+        if not html:
+            return None
+        return extract_all_prices_debug(html)
 
 async def get_scraped_current_price(url: str, asin: str):
     """Return (title, price, currency) scraping live (no cache)."""
