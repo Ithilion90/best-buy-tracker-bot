@@ -74,43 +74,84 @@ def extract_title_price_image(html: str):
             title = el.get_text(strip=True)
             break
 
-    price_text = None
-    # Priority order: prefer actual Amazon price over coupon/deal prices
-    # 1. Try main price block (excludes coupon badges)
-    for sel in [
+    # Collect ALL valid prices from the main product area
+    # Strategy: find all prices in MAIN PRODUCT AREA ONLY, filter out noise, select MINIMUM
+    candidate_prices = []
+    
+    # 1. Try primary selectors first (most reliable - main product price block)
+    primary_selectors = [
         "#corePrice_feature_div .a-price[data-a-color='price'] span.a-offscreen",
         "#corePrice_feature_div .a-price.a-text-price span.a-offscreen",
+        "#corePrice_feature_div .a-price span.a-offscreen",  # Any price in corePrice area
         "#apex_desktop .a-price[data-a-color='price'] span.a-offscreen",
+        "#apex_desktop .a-price span.a-offscreen",  # Any price in apex area
         "#priceblock_ourprice",
         "#priceblock_dealprice",
         "#priceblock_saleprice",
-    ]:
-        el = soup.select_one(sel)
-        if el and el.get_text(strip=True):
-            price_text = el.get_text(strip=True)
-            break
+    ]
     
-    # 2. Fallback: any offscreen price (may include coupons)
-    if not price_text:
-        offscreen_prices = soup.select("span.a-offscreen")
-        for el in offscreen_prices:
+    for sel in primary_selectors:
+        for el in soup.select(sel):
             text = el.get_text(strip=True)
-            # Skip if parent has coupon/badge indicators
+            # Skip if parent has shipping/delivery premium indicators
             parent = el.parent
+            skip = False
             if parent:
-                parent_class = ' '.join(parent.get('class', []))
-                # Skip coupon badges and promotional elements
-                if any(x in parent_class.lower() for x in ['coupon', 'badge', 'promotion', 'promo']):
-                    continue
-            if text:
-                price_text = text
-                break
-
+                parent_class = ' '.join(parent.get('class', [])).lower()
+                # Skip ONLY shipping variants and obvious non-product prices
+                if any(x in parent_class for x in ['shipping-', 'delivery-', 'ship-method']):
+                    skip = True
+            
+            if not skip and text:
+                parsed_price, parsed_currency = parse_price_text(text)
+                if parsed_price and parsed_price > 0:
+                    candidate_prices.append((parsed_price, parsed_currency, f"primary:{sel[:30]}"))
+    
+    # 2. ONLY if no primary prices, fallback to offscreen in MAIN content (not sidebars)
+    if not candidate_prices:
+        # Strictly limit to main product content areas
+        main_content = soup.select_one("#corePrice_feature_div, #apex_desktop, #ppd, #centerCol")
+        if main_content:
+            offscreen_prices = main_content.select("span.a-offscreen")
+            
+            for el in offscreen_prices:
+                text = el.get_text(strip=True)
+                # Skip if parent has indicators of non-product prices
+                parent = el.parent
+                if parent:
+                    parent_class = ' '.join(parent.get('class', [])).lower()
+                    parent_id = parent.get('id', '').lower()
+                    # Skip promotional elements, shipping, recommendations, etc.
+                    if any(x in parent_class for x in ['coupon', 'badge', 'promotion', 'promo', 'shipping', 'delivery']):
+                        continue
+                    # Skip "frequently bought together" and recommendations
+                    if any(x in parent_id for x in ['sims', 'session', 'bought', 'similar', 'fbt']):
+                        continue
+                
+                if text:
+                    parsed_price, parsed_currency = parse_price_text(text)
+                    if parsed_price and parsed_price > 0:
+                        candidate_prices.append((parsed_price, parsed_currency, "offscreen"))
+    
+    # Select MINIMUM price from candidates
     price = None
     currency = None
-    image_url: Optional[str] = None
-    if not price_text:
-        # Attempt to build from whole + fraction parts (common in some locales)
+    if candidate_prices:
+        # Sort by price ascending
+        candidate_prices.sort(key=lambda x: x[0])
+        
+        # Take the minimum price (first after sorting)
+        # No need for outlier filtering if we're focused on main product area
+        price, currency, source = candidate_prices[0]
+        logger.debug("Selected minimum price from candidates", 
+                    price=price, 
+                    currency=currency,
+                    source=source,
+                    total_candidates=len(candidate_prices))
+    
+    # Fallback: build from whole + fraction if no candidates found
+    if not price and not currency:
+        price_text = None
         whole = soup.select_one('span.a-price-whole')
         frac = soup.select_one('span.a-price-fraction')
         if whole and whole.get_text(strip=True):
@@ -118,8 +159,10 @@ def extract_title_price_image(html: str):
             if frac and frac.get_text(strip=True):
                 combined += "." + frac.get_text(strip=True)
             price_text = combined
-    if price_text:
-        price, currency = parse_price_text(price_text)
+            if price_text:
+                price, currency = parse_price_text(price_text)
+    
+    image_url: Optional[str] = None
 
     # Image selectors (try high-res first, then fallback)
     img_selectors = [
