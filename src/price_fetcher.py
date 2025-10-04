@@ -74,11 +74,11 @@ def extract_title_price_image(html: str):
             title = el.get_text(strip=True)
             break
 
-    # Collect ALL valid prices from the main product area
-    # Strategy: find all prices in MAIN PRODUCT AREA ONLY, filter out noise, select MINIMUM
+    # Collect ALL valid prices from ALL sellers (main + other sellers)
+    # Strategy: scan main product area + other sellers section, filter noise, select MINIMUM
     candidate_prices = []
     
-    # 1. Try primary selectors first (most reliable - main product price block)
+    # 1. Main product price block (default seller)
     primary_selectors = [
         "#corePrice_feature_div .a-price[data-a-color='price'] span.a-offscreen",
         "#corePrice_feature_div .a-price.a-text-price span.a-offscreen",
@@ -93,12 +93,11 @@ def extract_title_price_image(html: str):
     for sel in primary_selectors:
         for el in soup.select(sel):
             text = el.get_text(strip=True)
-            # Skip if parent has shipping/delivery premium indicators
+            # Skip shipping/delivery premium indicators
             parent = el.parent
             skip = False
             if parent:
                 parent_class = ' '.join(parent.get('class', [])).lower()
-                # Skip ONLY shipping variants and obvious non-product prices
                 if any(x in parent_class for x in ['shipping-', 'delivery-', 'ship-method']):
                     skip = True
             
@@ -107,7 +106,26 @@ def extract_title_price_image(html: str):
                 if parsed_price and parsed_price > 0:
                     candidate_prices.append((parsed_price, parsed_currency, f"primary:{sel[:30]}"))
     
-    # 2. ONLY if no primary prices, fallback to offscreen in MAIN content (not sidebars)
+    # 2. Other sellers / buying options section
+    # Look for alternative sellers with potentially better prices
+    other_sellers_selectors = [
+        "#aod-offer-price span.a-offscreen",  # All offers display
+        "#aod-price span.a-offscreen",  # AOD = Amazon Offer Display
+        "#mbc span.a-offscreen",  # More buying choices
+        ".mbc-offer-row .a-price span.a-offscreen",  # Individual seller rows
+        "a[href*='/gp/offer-listing/'] span.a-offscreen",  # Link to other sellers (shows min price)
+        "#moreBuyingChoices_feature_div span.a-offscreen",  # More buying choices widget
+    ]
+    
+    for sel in other_sellers_selectors:
+        for el in soup.select(sel):
+            text = el.get_text(strip=True)
+            if text:
+                parsed_price, parsed_currency = parse_price_text(text)
+                if parsed_price and parsed_price > 0:
+                    candidate_prices.append((parsed_price, parsed_currency, f"sellers:{sel[:30]}"))
+    
+    # 3. Fallback: offscreen prices in MAIN content (not sidebars/recommendations)
     if not candidate_prices:
         # Strictly limit to main product content areas
         main_content = soup.select_one("#corePrice_feature_div, #apex_desktop, #ppd, #centerCol")
@@ -133,21 +151,52 @@ def extract_title_price_image(html: str):
                     if parsed_price and parsed_price > 0:
                         candidate_prices.append((parsed_price, parsed_currency, "offscreen"))
     
-    # Select MINIMUM price from candidates
+    # Select MINIMUM price from candidates, with outlier filtering
     price = None
     currency = None
     if candidate_prices:
         # Sort by price ascending
         candidate_prices.sort(key=lambda x: x[0])
         
-        # Take the minimum price (first after sorting)
-        # No need for outlier filtering if we're focused on main product area
-        price, currency, source = candidate_prices[0]
-        logger.debug("Selected minimum price from candidates", 
-                    price=price, 
-                    currency=currency,
-                    source=source,
-                    total_candidates=len(candidate_prices))
+        # Filter out extreme outliers (likely accessories, bundles, or related products)
+        # Strategy: keep prices within reasonable range of minimum
+        min_price = candidate_prices[0][0]
+        
+        # If we have multiple candidates, apply smart filtering
+        if len(candidate_prices) > 1:
+            # Remove prices that are clearly accessories (< 50% of minimum reasonable price)
+            # Heuristic: if min is very low (< €30), it might be an accessory, so look at next prices
+            if min_price < 30:
+                # Find the first "cluster" of prices (within 20% of each other)
+                for i in range(len(candidate_prices) - 1):
+                    curr = candidate_prices[i][0]
+                    next_val = candidate_prices[i + 1][0]
+                    # If we find prices close together, start from there
+                    if next_val <= curr * 1.2 and curr >= 30:
+                        min_price = curr
+                        break
+        
+        # Select minimum from valid range
+        # Keep prices within 2x of minimum (filters out bundles)
+        max_reasonable = min_price * 2.0
+        valid_prices = [p for p in candidate_prices if p[0] <= max_reasonable and p[0] >= min_price * 0.9]
+        
+        if valid_prices:
+            price, currency, source = valid_prices[0]  # Take minimum
+            logger.debug("Selected minimum price across all sellers", 
+                        price=price, 
+                        currency=currency,
+                        source=source,
+                        total_candidates=len(candidate_prices),
+                        valid_candidates=len(valid_prices))
+        else:
+            # Fallback: just take the minimum if filtering removed everything
+            price, currency, source = candidate_prices[0]
+            logger.debug("Selected minimum price (no filtering)", 
+                        price=price, 
+                        currency=currency,
+                        source=source,
+                        total_candidates=len(candidate_prices))
     
     # Fallback: build from whole + fraction if no candidates found
     if not price and not currency:
