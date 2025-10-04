@@ -15,6 +15,7 @@ try:
     from src.utils import (
         extract_asin,
         with_affiliate,
+        build_product_url,
         truncate,
         resolve_and_normalize_amazon_url,
         domain_to_currency,
@@ -29,6 +30,7 @@ except ImportError:
     from utils import (
         extract_asin,
         with_affiliate,
+        build_product_url,
         truncate,
         resolve_and_normalize_amazon_url,
         domain_to_currency,
@@ -108,11 +110,21 @@ def extract_domain(url: str) -> Optional[str]:
     except Exception:
         return None
 
-async def send_price_notification(user_id: int, asin: str, title: str, old_price: float, new_price: float, min_price: float, max_price: float, app: Application, domain: str | None = None, currency: str | None = None) -> None:
-    """Send price notification to user (domain-aware, multi-currency)."""
+async def send_price_notification(user_id: int, asin: str, title: str, old_price: float, new_price: float, min_price: float, max_price: float, app: Application, domain: str | None = None, currency: str | None = None, availability: str | None = None) -> None:
+    """Send price notification to user (domain-aware, multi-currency).
+    
+    Args:
+        availability: Product availability status. If 'unavailable', notification is skipped.
+    """
     try:
+        # Skip notification if product is unavailable
+        if availability and availability.lower() == 'unavailable':
+            logger.info("Skipping notification for unavailable product", user_id=user_id, asin=asin, domain=domain)
+            return
+        
         dom = domain or 'amazon.it'
-        aff_url = with_affiliate(f"https://{dom}/dp/{asin}")
+        # Use simple /dp/ URL with affiliate tag
+        aff_url = build_product_url(dom, asin)
         title_display = truncate(title, 40)
         clickable_title = f"<a href=\"{aff_url}\">{title_display}</a>"
 
@@ -120,6 +132,9 @@ async def send_price_notification(user_id: int, asin: str, title: str, old_price
         curr = currency or domain_to_currency(dom)
         is_historical_min = abs(new_price - min_price) < 0.01 if min_price is not None else False
         hist_line = f"📉 <b>Historical Min:</b> {format_price(min_price, curr)}" if min_price is not None else ""
+        # Add hint about checking other sellers for best price
+        seller_hint = "\n\n💡 <i>Tip: Check 'Other Sellers' on Amazon for the best price</i>"
+        
         if is_historical_min:
             message = (
                 f"🔥 <b>HISTORICAL MINIMUM!</b> 🔥\n\n"
@@ -130,6 +145,7 @@ async def send_price_notification(user_id: int, asin: str, title: str, old_price
                 f"{hist_line}\n"
                 f"📈 <b>Historical Max:</b> {format_price(max_price, curr)}\n\n"
                 f"🎯 <b>This is the lowest price ever recorded!</b>"
+                f"{seller_hint}"
             )
         else:
             message = (
@@ -140,6 +156,7 @@ async def send_price_notification(user_id: int, asin: str, title: str, old_price
                 #f"💡 <b>Savings:</b> {format_price(old_price - new_price, curr)}\n"
                 f"{hist_line}\n"
                 f"📈 <b>Historical Max:</b> {format_price(max_price, curr)}"
+                f"{seller_hint}"
             )
 
         # Try to fetch image (scrape on-demand). Not cached to keep simple (caching would be feature 2).
@@ -290,6 +307,7 @@ async def refresh_prices_and_notify(app: Application) -> None:
                                 adj_max,
                                 app,
                                 domain=dom,
+                                availability=to_avail,
                             )
                 updated_items += 1
         logger.info("Refresh cycle complete", domains=len(domain_group), items_updated=updated_items)
@@ -421,27 +439,55 @@ async def handle_shared_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
             existing = None
         if existing:
             existing_domain = existing.get('domain') or extract_domain(existing.get('url') or '')
+            existing_asin = existing.get('asin') or asin
             current_display = existing.get('last_price') or existing.get('min_price') or 0
             min_display = existing.get('min_price') or current_display
             max_display = existing.get('max_price') or current_display
-            title_display_full = existing.get('title') or f"Amazon Product {asin}"
-            aff_url_existing = with_affiliate(existing.get('url'))
+            title_display_full = existing.get('title') or f"Amazon Product {existing_asin}"
+            # Use simple /dp/ URL with affiliate tag
+            dom_existing = existing_domain or 'amazon.it'
+            aff_url_existing = build_product_url(dom_existing, existing_asin)
             title_display = truncate(title_display_full, 60)
             clickable_title_existing = f"<a href=\"{aff_url_existing}\">{title_display}</a>"
             domain_disp = existing_domain or 'n/a'
             curr = existing.get('currency') or domain_to_currency(existing_domain)
+            
+            # Check availability status
+            avail_existing = (existing.get('availability') or '').lower()
+            status_line = ""
+            if avail_existing == 'unavailable':
+                status_line = "📦 <b>Status:</b> ❌ Not available\n"
+            elif avail_existing == 'preorder':
+                status_line = "📦 <b>Status:</b> 🕒 Pre-order\n"
+            elif avail_existing == 'in_stock':
+                status_line = "📦 <b>Status:</b> ✅ In stock\n"
+            elif avail_existing:
+                status_line = f"📦 <b>Status:</b> ℹ️ {avail_existing}\n"
+            
+            # Build message parts
+            message_parts = [
+                "📦 <b>Product Already Tracked</b>\n\n",
+                f"{clickable_title_existing}\n",
+                f"🌍 <b>Domain:</b> {domain_disp}\n",
+                status_line
+            ]
+            
+            # Show current price only if not unavailable
+            if avail_existing != 'unavailable':
+                message_parts.append(f"💰 <b>Current:</b> {format_price(current_display, curr)}\n")
+            
+            message_parts.extend([
+                f"📉 <b>Historical Min:</b> {format_price(min_display, curr)}\n",
+                f"📈 <b>Historical Max:</b> {format_price(max_display, curr)}\n\n",
+                "Use /list to view all products."
+            ])
+            
             await msg.edit_text(
-                "📦 <b>Product Already Tracked</b>\n\n"
-                f"{clickable_title_existing}\n"
-                f"🌍 <b>Domain:</b> {domain_disp}\n"
-                f"💰 <b>Current:</b> {format_price(current_display, curr)}\n"
-                f"📉 <b>Historical Min:</b> {format_price(min_display, curr)}\n"
-                f"📈 <b>Historical Max:</b> {format_price(max_display, curr)}\n\n"
-                "Use /list to view all products.",
+                "".join(message_parts),
                 parse_mode="HTML",
                 disable_web_page_preview=True
             )
-            logger.info("Duplicate link relayed (already tracked)", asin=asin, user_id=user.id, domain=existing_domain)
+            logger.info("Duplicate link relayed (already tracked)", asin=asin, user_id=user.id, domain=existing_domain, availability=avail_existing)
             return
 
         # Get product title, current price and image (use resolved URL) - sequential original flow
@@ -510,8 +556,9 @@ async def handle_shared_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
         # Validate price consistency - adjust min/max if needed but keep current price
         corrected_min, corrected_max = validate_price_consistency(current_price, min_price, max_price)
 
-        # Create affiliate link for display
-        aff_url = with_affiliate(url)
+        # Create affiliate link for display - use simple /dp/ URL
+        dom_for_url = domain or 'amazon.it'
+        aff_url = build_product_url(dom_for_url, asin)
         title_display = truncate(title, 60)
         clickable_title = f"<a href=\"{aff_url}\">{title_display}</a>"
         curr_added = currency or domain_to_currency(domain)
@@ -612,7 +659,9 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 lines.append(f"{i}. {title} - ❌ Data unavailable yet")
                 continue
             title_disp = truncate(r['title'] or f"Product {asin}", 40)
-            aff_url = with_affiliate(r['url'])
+            # Use simple /dp/ URL with affiliate tag
+            dom_for_url = dom or 'amazon.it'
+            aff_url = build_product_url(dom_for_url, asin)
             clickable = f"<a href=\"{aff_url}\">{title_disp}</a>"
             curr_row = r.get('currency') or domain_to_currency(dom)
             avail = (r.get('availability') or '').lower()

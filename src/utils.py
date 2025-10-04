@@ -73,19 +73,41 @@ def parse_price_text(text: str) -> Tuple[Optional[float], Optional[str]]:
 def truncate(text: str, max_len: int = 60) -> str:
     return text if len(text) <= max_len else (text[: max_len - 1] + "…")
 
-def with_affiliate(url: str) -> str:
+def with_affiliate(url: str, use_offer_listing: bool = False) -> str:
+    """Add affiliate tag to URL.
+    
+    Args:
+        url: Amazon product URL
+        use_offer_listing: Deprecated (Amazon redirects these anyway)
+    """
     tag = (config.affiliate_tag or "").strip()
-    if not tag:
-        return url
+    
     try:
         u = urlparse(url)
-        qs = dict(parse_qsl(u.query, keep_blank_values=True))
-        # Amazon affiliate tag key is usually 'tag'
-        qs["tag"] = tag
-        new_query = urlencode(qs)
-        return urlunparse((u.scheme, u.netloc, u.path, u.params, new_query, u.fragment))
+        
+        # Add affiliate tag and helpful parameters
+        if tag:
+            qs = dict(parse_qsl(u.query, keep_blank_values=True))
+            qs["tag"] = tag
+            new_query = urlencode(qs)
+            return urlunparse((u.scheme, u.netloc, u.path, u.params, new_query, u.fragment))
+        else:
+            return url
     except Exception:
         return url
+
+def build_product_url(domain: str, asin: str) -> str:
+    """Build Amazon product URL with affiliate tag.
+    
+    Args:
+        domain: Amazon domain (e.g., 'amazon.it', 'amazon.com')
+        asin: Product ASIN
+    
+    Returns:
+        URL to product page with affiliate tag
+    """
+    base_url = f"https://{domain}/dp/{asin}"
+    return with_affiliate(base_url)
 
 # --- New helpers for Amazon App shared links / short links ---
 SHORT_AMAZON_DOMAINS = {"amzn.to", "amzn.eu", "amzn.in", "amzn.asia", "a.co"}
