@@ -96,18 +96,42 @@ def with_affiliate(url: str, use_offer_listing: bool = False) -> str:
     except Exception:
         return url
 
-def build_product_url(domain: str, asin: str) -> str:
+def build_product_url(domain: str, asin: str, title: str | None = None) -> str:
     """Build Amazon product URL with affiliate tag.
     
     Args:
         domain: Amazon domain (e.g., 'amazon.it', 'amazon.com')
         asin: Product ASIN
+        title: Optional product title for SEO-friendly URL (helps Amazon routing)
     
     Returns:
-        URL to product page with affiliate tag
+        URL to product page with affiliate tag and ref parameter
     """
-    base_url = f"https://{domain}/dp/{asin}"
-    return with_affiliate(base_url)
+    # Build URL with optional title in path (Amazon's preferred format)
+    if title:
+        # Create URL-safe slug from title
+        import re
+        slug = re.sub(r'[^\w\s-]', '', title.lower())  # Remove special chars
+        slug = re.sub(r'[\s_]+', '-', slug)  # Replace spaces with hyphens
+        slug = slug[:80]  # Limit length
+        base_url = f"https://{domain}/{slug}/dp/{asin}"
+    else:
+        base_url = f"https://{domain}/dp/{asin}"
+    
+    # Add affiliate tag via with_affiliate
+    url_with_tag = with_affiliate(base_url)
+    
+    # Add ref parameter to help Amazon identify the source (reduces routing issues)
+    try:
+        u = urlparse(url_with_tag)
+        qs = dict(parse_qsl(u.query, keep_blank_values=True))
+        # Add ref parameter if not already present
+        if 'ref' not in qs:
+            qs['ref'] = 'nosim'  # "no similar items" - cleaner product page
+        new_query = urlencode(qs)
+        return urlunparse((u.scheme, u.netloc, u.path, u.params, new_query, u.fragment))
+    except Exception:
+        return url_with_tag
 
 # --- New helpers for Amazon App shared links / short links ---
 SHORT_AMAZON_DOMAINS = {"amzn.to", "amzn.eu", "amzn.in", "amzn.asia", "a.co"}

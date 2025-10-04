@@ -123,8 +123,8 @@ async def send_price_notification(user_id: int, asin: str, title: str, old_price
             return
         
         dom = domain or 'amazon.it'
-        # Use simple /dp/ URL with affiliate tag
-        aff_url = build_product_url(dom, asin)
+        # Use /dp/ URL with affiliate tag and title for better routing
+        aff_url = build_product_url(dom, asin, title)
         title_display = truncate(title, 40)
         clickable_title = f"<a href=\"{aff_url}\">{title_display}</a>"
 
@@ -444,9 +444,9 @@ async def handle_shared_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
             min_display = existing.get('min_price') or current_display
             max_display = existing.get('max_price') or current_display
             title_display_full = existing.get('title') or f"Amazon Product {existing_asin}"
-            # Use simple /dp/ URL with affiliate tag
+            # Use /dp/ URL with affiliate tag and title for better routing
             dom_existing = existing_domain or 'amazon.it'
-            aff_url_existing = build_product_url(dom_existing, existing_asin)
+            aff_url_existing = build_product_url(dom_existing, existing_asin, title_display_full)
             title_display = truncate(title_display_full, 60)
             clickable_title_existing = f"<a href=\"{aff_url_existing}\">{title_display}</a>"
             domain_disp = existing_domain or 'n/a'
@@ -556,9 +556,9 @@ async def handle_shared_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
         # Validate price consistency - adjust min/max if needed but keep current price
         corrected_min, corrected_max = validate_price_consistency(current_price, min_price, max_price)
 
-        # Create affiliate link for display - use simple /dp/ URL
+        # Create affiliate link for display with title for better routing
         dom_for_url = domain or 'amazon.it'
-        aff_url = build_product_url(dom_for_url, asin)
+        aff_url = build_product_url(dom_for_url, asin, title)
         title_display = truncate(title, 60)
         clickable_title = f"<a href=\"{aff_url}\">{title_display}</a>"
         curr_added = currency or domain_to_currency(domain)
@@ -658,10 +658,11 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 title = truncate(r['title'] or f"Product {asin}", 40)
                 lines.append(f"{i}. {title} - ❌ Data unavailable yet")
                 continue
-            title_disp = truncate(r['title'] or f"Product {asin}", 40)
-            # Use simple /dp/ URL with affiliate tag
+            title_full = r['title'] or f"Product {asin}"
+            title_disp = truncate(title_full, 40)
+            # Use /dp/ URL with affiliate tag and title for better routing
             dom_for_url = dom or 'amazon.it'
-            aff_url = build_product_url(dom_for_url, asin)
+            aff_url = build_product_url(dom_for_url, asin, title_full)
             clickable = f"<a href=\"{aff_url}\">{title_disp}</a>"
             curr_row = r.get('currency') or domain_to_currency(dom)
             avail = (r.get('availability') or '').lower()
