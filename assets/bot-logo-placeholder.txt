@@ -1,0 +1,12 @@
+# Placeholder for bot logo
+
+This file should be replaced with the actual bot logo image.
+
+## Instructions
+
+1. Create or design a logo image (512x512 px, PNG format)
+2. Save it as `bot-logo.png` in this directory
+3. Delete this placeholder file
+4. Commit and push to GitHub
+
+See README.md in this directory for detailed instructions on creating the logo.

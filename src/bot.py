@@ -334,18 +334,32 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await cmd_help(update, context)
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Help command"""
-    await update.message.reply_text(
-        "🤖 <b>Available Commands</b>\n\n"
+    """Help command with bot logo"""
+    # Amazon-themed logo URL - Shopping cart with price tag
+    # TODO: Replace with your custom logo URL
+    logo_url = "https://raw.githubusercontent.com/Ithilion90/best-buy-tracker-bot/main/assets/bot-logo.png"
+    
+    help_text = (
+        "🛒 <b>Amazon Price Tracker</b>\n\n"
+        "Track Amazon product prices and get notified when they drop!\n\n"
+        "<b>📋 Available Commands</b>\n\n"
         "/list — Show tracked products with prices\n"
         "/remove &lt;number&gt; — Remove specific product\n"
         "/remove all — Remove all tracked products\n"
-        "/debugprice &lt;number&gt; — Debug price detection\n"
         "/help — Show this guide\n\n"
         "💡 <b>Tip:</b> Share an Amazon link to add it automatically!\n"
-        "📢 <b>Notifications:</b> You'll be alerted when prices drop!",
-        parse_mode="HTML"
+        "📢 <b>Notifications:</b> You'll be alerted when prices drop!"
     )
+    
+    try:
+        await update.message.reply_photo(
+            photo=logo_url,
+            caption=help_text,
+            parse_mode="HTML"
+        )
+    except Exception:
+        # Fallback to text-only if image fails
+        await update.message.reply_text(help_text, parse_mode="HTML")
 
 async def handle_shared_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle shared Amazon links - MAIN FUNCTIONALITY.
@@ -736,14 +750,14 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             
             # Check new_only status
             new_only = r.get('new_only', 0)
-            new_only_indicator = "🆕 NEW ONLY" if new_only else ""
+            new_only_indicator = "🆕 NEW ONLY" if new_only else "🔄 NEW + USED"
             
             # Build product message with uniform formatting (no separators)
             # ALWAYS show same number of lines for uniform card height
             product_lines = [f"<b>{i}.</b> {clickable}"]
             
-            # Line 2: NEW ONLY indicator or empty space (for uniform height)
-            product_lines.append(f"     {new_only_indicator}" if new_only_indicator else "")
+            # Line 2: Tracking mode indicator (always shown for uniform height, aligned with other fields)
+            product_lines.append(f"🔍 <b>Tracking:</b> {new_only_indicator}")
             
             # Line 3: Domain (always shown)
             product_lines.append(f"🌍 <b>Domain:</b> {dom or 'n/a'}")
@@ -996,7 +1010,7 @@ async def handle_toggle_new_only(update: Update, context: ContextTypes.DEFAULT_T
         
         # Check new_only status (now updated)
         new_only = new_state
-        new_only_indicator = "🆕 NEW ONLY" if new_only else ""
+        new_only_indicator = "🆕 NEW ONLY" if new_only else "🔄 NEW + USED"
         
         # Detect message format: "Product Added" vs "/list" format
         original_text = query.message.caption if query.message.photo else query.message.text
@@ -1010,10 +1024,9 @@ async def handle_toggle_new_only(update: Update, context: ContextTypes.DEFAULT_T
             product_lines = [
                 "✅ <b>Product Added!</b>",
                 "",
-                f"📦 {clickable_title}"
+                f"📦 {clickable_title}",
+                f"🔍 <b>Tracking:</b> {new_only_indicator}"
             ]
-            if new_only_indicator:
-                product_lines.append(f"     {new_only_indicator}")
             
             product_lines.extend([
                 f"💰 <b>Current Price:</b> {format_price(cur_p, curr_row)}",
@@ -1027,8 +1040,8 @@ async def handle_toggle_new_only(update: Update, context: ContextTypes.DEFAULT_T
             # ALWAYS show same number of lines for uniform card height
             product_lines = [f"<b>{product_num}.</b> {clickable}"]
             
-            # Line 2: NEW ONLY indicator or empty space (for uniform height)
-            product_lines.append(f"     {new_only_indicator}" if new_only_indicator else "")
+            # Line 2: Tracking mode indicator (always shown for uniform height, aligned with other fields)
+            product_lines.append(f"🔍 <b>Tracking:</b> {new_only_indicator}")
             
             # Line 3: Domain (always shown)
             product_lines.append(f"🌍 <b>Domain:</b> {dom or 'n/a'}")
@@ -1112,7 +1125,7 @@ def main() -> None:
         backend = 'PostgreSQL' if getattr(db, 'is_postgres', lambda: False)() else 'SQLite'
     except Exception:
         backend = 'unknown'
-    logger.info("Starting Amazon Keepa Price Tracker Bot with notifications", db_backend=backend)
+    logger.info("Starting Amazon Price Tracker Bot", db_backend=backend)
     
     app = Application.builder().token(config.bot_token).build()
     
@@ -1121,6 +1134,19 @@ def main() -> None:
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("remove", cmd_remove))
+    
+    # Set bot commands for autocomplete menu
+    async def set_commands(application: Application) -> None:
+        from telegram import BotCommand
+        commands = [
+            BotCommand("start", "Start the bot and see help"),
+            BotCommand("help", "Show bot guide and commands"),
+            BotCommand("list", "Show all tracked products"),
+            BotCommand("remove", "Remove a tracked product"),
+        ]
+        await application.bot.set_my_commands(commands)
+    
+    app.post_init = set_commands
     
     # Callback query handler for inline buttons
     app.add_handler(CallbackQueryHandler(handle_toggle_new_only, pattern=r'^toggle_new_\d+$'))
@@ -1197,64 +1223,6 @@ def main() -> None:
         await update.message.reply_text("\n".join(msg_lines))
     app.add_handler(CommandHandler("debugasin", cmd_debugasin))
     
-    # /debugprice <number> command to inspect all prices on product page
-    async def cmd_debugprice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        await ensure_user_in_db(update)
-        user = update.effective_user
-        if not context.args:
-            await update.message.reply_text("Usage: /debugprice <number>\n\nUse /list to see product numbers")
-            return
-        try:
-            index = int(context.args[0]) - 1
-        except ValueError:
-            await update.message.reply_text("❌ Invalid number. Use /debugprice <number>")
-            return
-        
-        rows = db.list_items(user.id)
-        if index < 0 or index >= len(rows):
-            await update.message.reply_text("❌ Invalid product number. Use /list to see available products.")
-            return
-        
-        item = rows[index]
-        url = item.get('url')
-        if not url:
-            await update.message.reply_text("❌ No URL found for this product")
-            return
-        
-        msg = await update.message.reply_text("🔍 Analyzing prices on product page...")
-        
-        try:
-            from src.price_fetcher import fetch_price_debug  # type: ignore
-        except ImportError:
-            from price_fetcher import fetch_price_debug  # type: ignore
-        
-        debug_info = await fetch_price_debug(url)
-        
-        if not debug_info:
-            await msg.edit_text("❌ Failed to fetch page. Check URL or try again.")
-            return
-        
-        lines = [f"🔍 <b>Price Debug: {item.get('title', 'Product')[:40]}</b>\n"]
-        lines.append(f"<b>Selected Price:</b> {debug_info['selected_price'] or 'None'}")
-        lines.append(f"<b>Source:</b> {debug_info['selected_source'] or 'None'}\n")
-        
-        if debug_info['primary_selectors']:
-            lines.append("<b>Primary Selectors Found:</b>")
-            for name, price in debug_info['primary_selectors'].items():
-                lines.append(f"  • {name}: {price}")
-            lines.append("")
-        
-        if debug_info['all_offscreen']:
-            lines.append(f"<b>All Offscreen Prices ({len(debug_info['all_offscreen'])}):</b>")
-            for i, item_price in enumerate(debug_info['all_offscreen'][:10], 1):
-                coupon_flag = " [COUPON]" if item_price['is_coupon'] else ""
-                lines.append(f"  {i}. {item_price['text']}{coupon_flag}")
-            if len(debug_info['all_offscreen']) > 10:
-                lines.append(f"  ... and {len(debug_info['all_offscreen']) - 10} more")
-        
-        await msg.edit_text("\n".join(lines), parse_mode="HTML")
-    
-    app.add_handler(CommandHandler("debugprice", cmd_debugprice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_shared_link))
     
     # Unknown command handler (must be after known commands)
@@ -1264,12 +1232,20 @@ def main() -> None:
     app.add_error_handler(error_handler)
     
     # Start periodic price checking in a separate task after the app starts
-    async def post_init(application: Application) -> None:
+    async def post_init_combined(application: Application) -> None:
+        from telegram import BotCommand
+        commands = [
+            BotCommand("start", "Start the bot and see help"),
+            BotCommand("help", "Show bot guide and commands"),
+            BotCommand("list", "Show all tracked products"),
+            BotCommand("remove", "Remove a tracked product"),
+        ]
+        await application.bot.set_my_commands(commands)
         asyncio.create_task(periodic_price_check(application))
     
-    app.post_init = post_init
+    app.post_init = post_init_combined
     
-    logger.info("Bot started successfully - Price tracking and notifications active")
+    logger.info("Amazon Price Tracker Bot started successfully - Price tracking and notifications active")
     app.run_polling()
 
 if __name__ == "__main__":
