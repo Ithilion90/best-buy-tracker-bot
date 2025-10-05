@@ -1,47 +1,65 @@
-# FEATURE: UI Uniforme e Pulsante Track NEW Only dopo /add
+# FEATURE: UI Pulita con Pulsanti Chiari
+**Esempio Output:**
+```
+1. Apple AirPods Pro (2nd generation)
+     🆕 NEW ONLY
+🌍 Domain: amazon.com
+📦 Status: ✅ In stock
+💰 Current: $84.99
+📉 Historical Min: $79.99
+📈 Historical Max: $94.99
+[🔄 Track ALL (New + Used)]
+```
 
-## Data
-5 Ottobre 2025
+### 2. Pulsanti Chiari e Descrittivi
 
-## Richiesta Utente
+**Evoluzione:**
+- **V1**: `❌ Track ALL` ← Icona confusa (sembra "cancella")
+- **V2 FINALE**: `🔄 Track ALL (New + Used)` ← Icona chiara + testo esplicativo!
+
+**Caratteristiche:**
+- ✅ **Icona 🔄** (frecce circolari) → Indica "switch/cambio modalità"
+- ✅ **Testo "(New + Used)"** → Chiarisce che traccia anche usato
+- ✅ **Inglese** → Standard internazionale
+- ✅ **Immediata comprensione** dell'azionetobre 2025
+
+## Versione Finale
+Dopo iterazioni con l'utente, la UI è stata ottimizzata per massima chiarezza e pulizia.
+
+## Richieste Utente (Iterazioni)
+
+**Iterazione 1:**
 1. Rendere i riquadri dei prodotti in `/list` tutti con la **stessa dimensione (massima possibile)**
 2. Aggiungere il **pulsante "Track NEW Only"** al messaggio che appare dopo aver condiviso un prodotto
 
+**Iterazione 2 (FINALE):**
+1. **Rimuovere separatori** (────) tra le righe in `/list`
+2. Cambiare **icona da ❌ a 🔄** per il pulsante "Track ALL"
+3. Aggiungere **testo esplicativo in inglese**: "Track ALL (New + Used)"
+
 ## Implementazione
 
-### 1. Riquadri Uniformi in `/list`
+### 1. UI Pulita in `/list`
 
-**Problema precedente:**
-- Riquadri con altezze diverse (alcuni prodotti avevano Status, altri no)
-- Nessun separatore visivo tra i prodotti
-- Difficile confrontare rapidamente le informazioni
-
-**Soluzione:**
+**Versione Finale:**
 ```python
-# Separatore visivo
-separator = "─" * 40
+# NO separatori - UI più pulita
+product_lines = [f"<b>{i}.</b> {clickable}"]
+if new_only_indicator:
+    product_lines.append(f"     {new_only_indicator}")
 
-# Struttura fissa per ogni prodotto:
-product_lines = [
-    separator,
-    f"<b>{i}.</b> {clickable}",
-    (NEW ONLY indicator se presente),
-    separator,
-    f"🌍 <b>Domain:</b> {dom or 'n/a'}",
-    f"📦 <b>Status:</b> {stock_line}",  # SEMPRE presente
-    f"💰 <b>Current:</b> {format_price(cur_p, curr_row)}",  # SEMPRE presente (con '—' se non disponibile)
-    f"📉 <b>Historical Min:</b> {format_price(min_p, curr_row)}",
-    f"📈 <b>Historical Max:</b> {format_price(max_p, curr_row)}",
-    separator
-]
+product_lines.append(f"🌍 <b>Domain:</b> {dom or 'n/a'}")
+product_lines.append(f"📦 <b>Status:</b> {stock_line or '✅ In stock'}")
+product_lines.append(f"💰 <b>Current:</b> {format_price(cur_p, curr_row)}")
+product_lines.append(f"📉 <b>Historical Min:</b> {format_price(min_p, curr_row)}")
+product_lines.append(f"📈 <b>Historical Max:</b> {format_price(max_p, curr_row)}")
 ```
 
 **Caratteristiche:**
-- ✅ **Separatori visivi**: Linee `────` sopra e sotto ogni prodotto
-- ✅ **Altezza uniforme**: Status **sempre** presente (anche se "✅ In stock")
-- ✅ **Current price sempre visualizzato**: Con fallback `—` se non disponibile
-- ✅ **NEW ONLY indicator separato**: Su riga dedicata per chiarezza
-- ✅ **Titolo più lungo**: 45 caratteri invece di 40 per sfruttare larghezza massima
+- ❌ **RIMOSSI separatori** `────` (troppo cluttering)
+- ✅ **Altezza uniforme** preservata (Status sempre presente)
+- ✅ **Current price sempre presente** (con `—` se non disponibile)
+- ✅ **Layout compatto** e leggibile
 
 **Esempio Output:**
 ```
@@ -58,7 +76,7 @@ product_lines = [
 [❌ Track ALL]
 ```
 
-### 2. Pulsante Track NEW Only dopo `/add`
+### 3. Pulsante Track NEW Only dopo `/add`
 
 **Problema precedente:**
 - Dopo aver aggiunto un prodotto, l'utente doveva fare `/list` per attivare "Track NEW Only"

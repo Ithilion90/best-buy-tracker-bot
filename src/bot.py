@@ -738,17 +738,11 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             new_only = r.get('new_only', 0)
             new_only_indicator = "🆕 NEW ONLY" if new_only else ""
             
-            # Build product message with fixed width for uniformity
-            # Using separator line and consistent formatting
-            separator = "─" * 40
-            product_lines = [
-                separator,
-                f"<b>{i}.</b> {clickable}"
-            ]
+            # Build product message with uniform formatting (no separators)
+            product_lines = [f"<b>{i}.</b> {clickable}"]
             if new_only_indicator:
                 product_lines.append(f"     {new_only_indicator}")
             
-            product_lines.append(separator)
             product_lines.append(f"🌍 <b>Domain:</b> {dom or 'n/a'}")
             
             if stock_line:
@@ -768,11 +762,10 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             
             product_lines.append(f"📉 <b>Historical Min:</b> {format_price(min_p, curr_row)}")
             product_lines.append(f"📈 <b>Historical Max:</b> {format_price(max_p, curr_row)}")
-            product_lines.append(separator)
             
             # Create toggle button for this product
             item_id = r.get('id')
-            button_text = "❌ Track ALL" if new_only else "🆕 Track NEW Only"
+            button_text = "🔄 Track ALL (New + Used)" if new_only else "🆕 Track NEW Only"
             keyboard = InlineKeyboardMarkup([[
                 InlineKeyboardButton(button_text, callback_data=f"toggle_new_{item_id}")
             ]])
@@ -905,19 +898,21 @@ async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 async def handle_toggle_new_only(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle toggle new_only button callback"""
     query = update.callback_query
-    await query.answer()
     
     user = update.effective_user
     if not user:
-        await query.edit_message_text("❌ User not found")
+        await query.answer("❌ User not found", show_alert=True)
         return
     
     # Parse callback data: "toggle_new_{item_id}"
     try:
         item_id = int(query.data.split('_')[-1])
     except (ValueError, IndexError):
-        await query.edit_message_text("❌ Invalid callback data")
+        await query.answer("❌ Invalid callback data", show_alert=True)
         return
+    
+    # Show loading indicator immediately
+    await query.answer("🔄 Updating prices...")
     
     # Toggle new_only flag
     try:
@@ -938,9 +933,6 @@ async def handle_toggle_new_only(update: Update, context: ContextTypes.DEFAULT_T
         if not asin:
             await query.edit_message_text("❌ Invalid product data")
             return
-        
-        # Show loading indicator
-        await query.answer("🔄 Updating prices...")
         
         # Fetch prices with new_only filter
         try:
@@ -1028,16 +1020,11 @@ async def handle_toggle_new_only(update: Update, context: ContextTypes.DEFAULT_T
                 "📢 <b>You'll be notified when the price change!</b>"
             ])
         else:
-            # Build message in "/list" format with separators
-            separator = "─" * 40
-            product_lines = [
-                separator,
-                f"<b>{product_num}.</b> {clickable}"
-            ]
+            # Build message in "/list" format (no separators)
+            product_lines = [f"<b>{product_num}.</b> {clickable}"]
             if new_only_indicator:
                 product_lines.append(f"     {new_only_indicator}")
             
-            product_lines.append(separator)
             product_lines.append(f"🌍 <b>Domain:</b> {dom or 'n/a'}")
             
             if stock_line:
@@ -1055,10 +1042,9 @@ async def handle_toggle_new_only(update: Update, context: ContextTypes.DEFAULT_T
             
             product_lines.append(f"📉 <b>Historical Min:</b> {format_price(min_p, curr_row)}")
             product_lines.append(f"📈 <b>Historical Max:</b> {format_price(max_p, curr_row)}")
-            product_lines.append(separator)
         
         # Update button text
-        button_text = "❌ Track ALL" if new_only else "🆕 Track NEW Only"
+        button_text = "🔄 Track ALL (New + Used)" if new_only else "🆕 Track NEW Only"
         keyboard = InlineKeyboardMarkup([[
             InlineKeyboardButton(button_text, callback_data=f"toggle_new_{item_id}")
         ]])
