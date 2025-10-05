@@ -219,20 +219,28 @@ def get_keepa_domain_name(domain_override: Optional[str] = None) -> str:
     return mapping.get(dom, "US")
 
 @retry_with_backoff(max_retries=3, exceptions=(Exception,))
-def fetch_lifetime_min_max_current(asin_list: List[str], domain: Optional[str] = None, force: bool = False) -> Dict[str, Tuple[Optional[float], Optional[float], Optional[float]]]:
-    """Return {asin: (min, max, current)} lifetime prices (always fetched fresh)."""
+def fetch_lifetime_min_max_current(asin_list: List[str], domain: Optional[str] = None, force: bool = False, new_only: bool = False) -> Dict[str, Tuple[Optional[float], Optional[float], Optional[float]]]:
+    """Return {asin: (min, max, current)} lifetime prices (always fetched fresh).
+    
+    Args:
+        asin_list: List of ASINs to fetch
+        domain: Amazon domain (e.g. 'com', 'it')
+        force: Force refresh (currently unused)
+        new_only: If True, fetch NEW condition prices only (stats index 18), 
+                 otherwise fetch Amazon prices (stats index 0)
+    """
     key = (getattr(config, "keepa_api_key", "") or "").strip()
     if not key or not asin_list:
         return {}
     try:
         # Primary: keepa package
-        return circuit_breakers['keepa_api'].call(_fetch_from_keepa_package_with_current, key, asin_list, domain)
+        return circuit_breakers['keepa_api'].call(_fetch_from_keepa_package_with_current, key, asin_list, domain, new_only)
     except ImportError:
         try:
-            return _fetch_from_pykeepa_with_current(key, asin_list, domain)
+            return _fetch_from_pykeepa_with_current(key, asin_list, domain, new_only)
         except ImportError:
             try:
-                return circuit_breakers['keepa_api'].call(_fetch_via_http_with_current, asin_list, key, domain)
+                return circuit_breakers['keepa_api'].call(_fetch_via_http_with_current, asin_list, key, domain, new_only)
             except Exception as e:
                 logger.error("All Keepa methods failed", error=str(e))
                 return {asin: (None, None, None) for asin in asin_list}
@@ -261,7 +269,7 @@ def fetch_lifetime_min_max(asin_list: List[str], domain: Optional[str] = None, f
         logger.error("Keepa API failed", error=str(e), asins=len(asin_list))
         return {asin: (None, None) for asin in asin_list}
 
-def _fetch_from_keepa_package_with_current(key: str, asin_list: List[str], domain: Optional[str]) -> Dict[str, Tuple[Optional[float], Optional[float], Optional[float]]]:
+def _fetch_from_keepa_package_with_current(key: str, asin_list: List[str], domain: Optional[str], new_only: bool = False) -> Dict[str, Tuple[Optional[float], Optional[float], Optional[float]]]:
     """Fetch from keepa package with current prices"""
     api = keepa.Keepa(key)
     products_resp = api.query(
@@ -271,9 +279,9 @@ def _fetch_from_keepa_package_with_current(key: str, asin_list: List[str], domai
         history=True  # enable history so we can compute proper min/max from csv/data
     )
     products = _normalize_products(products_resp)
-    return _parse_keepa_products_with_current(products)
+    return _parse_keepa_products_with_current(products, new_only)
 
-def _fetch_from_pykeepa_with_current(key: str, asin_list: List[str], domain: Optional[str]) -> Dict[str, Tuple[Optional[float], Optional[float], Optional[float]]]:
+def _fetch_from_pykeepa_with_current(key: str, asin_list: List[str], domain: Optional[str], new_only: bool = False) -> Dict[str, Tuple[Optional[float], Optional[float], Optional[float]]]:
     """Fetch from pykeepa with current prices"""
     import pykeepa  # type: ignore
     try:
@@ -287,7 +295,7 @@ def _fetch_from_pykeepa_with_current(key: str, asin_list: List[str], domain: Opt
     except Exception:
         products_resp = []
     products = _normalize_products(products_resp)
-    return _parse_keepa_products_with_current(products)
+    return _parse_keepa_products_with_current(products, new_only)
 
 def _fetch_from_keepa_package(key: str, asin_list: List[str], domain: Optional[str]) -> Dict[str, Tuple[Optional[float], Optional[float]]]:
     """Fetch from keepa package"""
@@ -318,7 +326,7 @@ def _fetch_from_pykeepa(key: str, asin_list: List[str], domain: Optional[str]) -
     return _parse_keepa_products(products)
 
 
-def _pick_amazon_stat(stats: dict, key: str) -> Optional[float]:
+def _pick_amazon_stat(stats: dict, key: str, new_only: bool = False) -> Optional[float]:
     """Extract Amazon price (in cents) for the requested stat key.
 
     Root cause of previous exaggerated max values: we treated list-pair entries
@@ -328,14 +336,22 @@ def _pick_amazon_stat(stats: dict, key: str) -> Optional[float]:
     max values.
 
     Heuristics:
-    - Prefer index 0 (Amazon) if scalar or pair.
+    - Keepa stats array structure: [Amazon, Marketplace, NEW, Used, Sales, ListPrice, ...]
+      * Index 0 = Amazon price
+      * Index 2 = NEW condition offers
+    - Keepa uses -1 to indicate "no data available"
     - For a 2-length pair (a,b) decide which is price:
         * If one element > 2_000_000 and the other < 2_000_000 -> smaller is price.
         * Else if a < 200_000 and b > 200_000 -> a is price.
         * Else assume first element is price (Keepa spec: [price, time]).
     - Skip obvious timestamp-only numbers (> 2_000_000) when alone.
-    - Fallback: scan list for first plausible price 1..2_000_000.
+    - When new_only=True, return None if NEW data not available (don't fallback)
     - Dict form: try common labels.
+    
+    Args:
+        stats: Stats dict from Keepa product
+        key: 'current', 'min', or 'max'
+        new_only: If True, use index 2 (NEW offers), else 0 (Amazon)
     """
     val = stats.get(key)
     if val is None:
@@ -355,8 +371,18 @@ def _pick_amazon_stat(stats: dict, key: str) -> Optional[float]:
         return None
 
     if isinstance(val, (list, tuple)):
-        # Direct candidates (Amazon condition usually at index 0)
-        primary = val[0] if len(val) > 0 else None
+        # Select the appropriate index based on new_only flag
+        # Index 0 = Amazon, Index 1 = NEW offers, Index 2 = USED offers
+        # Keepa stats array: [Amazon, NEW, Used, ?, Sales, ListPrice, ...]
+        target_index = 1 if new_only else 0
+        
+        # Direct candidates (condition at target_index)
+        primary = val[target_index] if len(val) > target_index else (val[0] if len(val) > 0 else None)
+        
+        # Keepa uses -1 to indicate "no data available"
+        if primary == -1:
+            primary = None
+        
         candidates = []
         if isinstance(primary, (list, tuple)) and len(primary) >= 2:
             price = extract_from_pair(primary[0], primary[1])
@@ -364,19 +390,33 @@ def _pick_amazon_stat(stats: dict, key: str) -> Optional[float]:
                 return float(price)
         elif isinstance(primary, (int, float)) and 0 < primary < 2_000_000:
             return float(primary)
-        # Scan remaining entries
-        for v in val:
-            price = None
-            if isinstance(v, (list, tuple)) and len(v) >= 2:
-                price = extract_from_pair(v[0], v[1])
-            elif isinstance(v, (int, float)):
-                price = v if 0 < v < 2_000_000 else None
-            if isinstance(price, (int, float)) and 0 < price < 2_000_000:
-                return float(price)
+        
+        # If target index has no data and we're looking for NEW, return None
+        # (don't fallback to Amazon/Used prices when user explicitly wants NEW only)
+        if new_only and (primary is None or primary == -1):
+            return None
+        
+        # Scan remaining entries only if not new_only (for backward compatibility)
+        if not new_only:
+            for v in val:
+                if v == -1:  # Skip Keepa's "no data" marker
+                    continue
+                price = None
+                if isinstance(v, (list, tuple)) and len(v) >= 2:
+                    price = extract_from_pair(v[0], v[1])
+                elif isinstance(v, (int, float)):
+                    price = v if 0 < v < 2_000_000 else None
+                if isinstance(price, (int, float)) and 0 < price < 2_000_000:
+                    return float(price)
         return None
 
     if isinstance(val, dict):
-        for k in ("AMAZON", "amazon", "AMZ", 0, "0", "NEW", "new", 1, "1"):
+        # Try common labels (prioritize NEW when new_only=True)
+        keys_to_try = (
+            ("NEW", "new", 1, "1", "AMAZON", "amazon", "AMZ", 0, "0") if new_only
+            else ("AMAZON", "amazon", "AMZ", 0, "0", "NEW", "new", 1, "1")
+        )
+        for k in keys_to_try:
             v = val.get(k)
             if isinstance(v, (int, float)) and 0 < v < 2_000_000:
                 return float(v)
@@ -414,8 +454,13 @@ def _normalize_products(products_resp) -> List[dict]:
 
     # Removed unused helper _extract_prices_from_stat_array (cleanup)
 
-def _parse_keepa_products_with_current(products: List[dict]) -> Dict[str, Tuple[Optional[float], Optional[float], Optional[float]]]:
-    """Parse Keepa products to extract min, max, and current prices with diagnostics."""
+def _parse_keepa_products_with_current(products: List[dict], new_only: bool = False) -> Dict[str, Tuple[Optional[float], Optional[float], Optional[float]]]:
+    """Parse Keepa products to extract min, max, and current prices with diagnostics.
+    
+    Args:
+        products: List of product dicts from Keepa
+        new_only: If True, use stats index 18 (NEW offers), else index 0 (Amazon)
+    """
     out: Dict[str, Tuple[Optional[float], Optional[float], Optional[float]]] = {}
     for p in products or []:
         asin = (p.get('asin') or '').strip()
@@ -424,17 +469,17 @@ def _parse_keepa_products_with_current(products: List[dict]) -> Dict[str, Tuple[
 
         stats = p.get('stats') or {}
         try:
-            logger.debug("Keepa diagnostic", asin=asin, stats_keys=list(stats.keys())[:12], has_csv=bool(p.get('csv')), has_data=bool(p.get('data')))
+            logger.debug("Keepa diagnostic", asin=asin, stats_keys=list(stats.keys())[:12], has_csv=bool(p.get('csv')), has_data=bool(p.get('data')), new_only=new_only)
         except Exception:
             pass
-        # Prefer explicitly Amazon (index 0) values from stats without mixing other conditions.
+        # Prefer explicitly Amazon (index 0) or NEW (index 18) values from stats without mixing other conditions.
         raw_current: Optional[float] = None
         raw_min: Optional[float] = None
         raw_max: Optional[float] = None
         if stats:
-            raw_current = _pick_amazon_stat(stats, 'current')
-            raw_min = _pick_amazon_stat(stats, 'min')
-            raw_max = _pick_amazon_stat(stats, 'max')
+            raw_current = _pick_amazon_stat(stats, 'current', new_only)
+            raw_min = _pick_amazon_stat(stats, 'min', new_only)
+            raw_max = _pick_amazon_stat(stats, 'max', new_only)
             # If min/max absent but current present, initialize (will still allow history improvement)
             if (not isinstance(raw_min, (int, float)) or raw_min <= 0) and isinstance(raw_current, (int, float)) and raw_current > 0:
                 raw_min = raw_current
@@ -659,7 +704,7 @@ def _minmax_from_history(product: dict) -> Tuple[Optional[float], Optional[float
     return (min(filtered), max(filtered))
 
 
-def _fetch_via_http_with_current(asin_list: List[str], api_key: str, domain: Optional[str]) -> Dict[str, Tuple[Optional[float], Optional[float], Optional[float]]]:
+def _fetch_via_http_with_current(asin_list: List[str], api_key: str, domain: Optional[str], new_only: bool = False) -> Dict[str, Tuple[Optional[float], Optional[float], Optional[float]]]:
     import httpx  # lazy import
     params = {
         "key": api_key,
@@ -685,7 +730,7 @@ def _fetch_via_http_with_current(asin_list: List[str], api_key: str, domain: Opt
             "csv": p.get("csv"),
             "data": p.get("data"),
         })
-    return _parse_keepa_products_with_current(norm)
+    return _parse_keepa_products_with_current(norm, new_only)
 
 def _fetch_via_http(asin_list: List[str], api_key: str, domain: Optional[str]) -> Dict[str, Tuple[Optional[float], Optional[float]]]:
     import httpx  # lazy import

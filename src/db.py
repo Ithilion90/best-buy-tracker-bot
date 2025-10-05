@@ -148,12 +148,17 @@ def _init_db_postgres(conn):  # pragma: no cover (not hit in SQLite tests)
             notification_sent_at TIMESTAMPTZ,
             category TEXT,
             priority INTEGER DEFAULT 1,
-            is_active BOOLEAN DEFAULT TRUE
+            is_active BOOLEAN DEFAULT TRUE,
+            new_only BOOLEAN DEFAULT FALSE
         )
     """)
-    # Ensure new columns exist
+    # Ensure new columns exist (for existing DBs)
     try:
         cur.execute("ALTER TABLE items ADD COLUMN IF NOT EXISTS availability TEXT")
+    except Exception:
+        pass
+    try:
+        cur.execute("ALTER TABLE items ADD COLUMN IF NOT EXISTS new_only BOOLEAN DEFAULT FALSE")
     except Exception:
         pass
     # Price history
@@ -246,6 +251,7 @@ def _create_fresh_schema(conn):
             priority INTEGER DEFAULT 1,
             is_active BOOLEAN DEFAULT 1,
             availability TEXT,
+            new_only BOOLEAN DEFAULT 0, -- Track only NEW condition products
             FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
         )
     """)
@@ -303,7 +309,8 @@ def _migrate_existing_schema(conn):
         'priority': 'INTEGER DEFAULT 1',
     'is_active': 'BOOLEAN DEFAULT 1',
     'domain': 'TEXT',
-    'availability': 'TEXT'
+    'availability': 'TEXT',
+    'new_only': 'BOOLEAN DEFAULT 0'
     }
     
     for column_name, column_def in new_columns.items():
@@ -721,3 +728,34 @@ def get_system_metrics(metric_name: str, hours: int = 24) -> List[Dict[str, Any]
         else:
             rows = conn.execute("SELECT * FROM system_metrics WHERE metric_name = ? AND timestamp > datetime('now', '-' || ? || ' hours') ORDER BY timestamp DESC", (metric_name, hours)).fetchall()
             return [dict(row) for row in rows]
+
+def toggle_new_only(item_id: int, user_id: int) -> bool:
+    """Toggle new_only flag for an item. Returns new state (True if now tracking new only)."""
+    with get_db_connection() as conn:
+        if _is_postgres:
+            cur = conn.cursor()
+            # Get current state
+            cur.execute("SELECT new_only FROM items WHERE id = %s AND user_id = %s", (item_id, user_id))
+            row = cur.fetchone()
+            if not row:
+                return False
+            current_state = row[0] if row[0] is not None else False
+            new_state = not current_state
+            # Update
+            cur.execute("UPDATE items SET new_only = %s, updated_at = NOW() WHERE id = %s AND user_id = %s", (new_state, item_id, user_id))
+            conn.commit()
+            logger.info("Toggled new_only", item_id=item_id, user_id=user_id, new_state=new_state)
+            return new_state
+        else:
+            # Get current state
+            row = conn.execute("SELECT new_only FROM items WHERE id = ? AND user_id = ?", (item_id, user_id)).fetchone()
+            if not row:
+                return False
+            current_state = bool(row[0]) if row[0] is not None else False
+            new_state = not current_state
+            # Update
+            conn.execute("UPDATE items SET new_only = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?", (int(new_state), item_id, user_id))
+            conn.commit()
+            logger.info("Toggled new_only", item_id=item_id, user_id=user_id, new_state=new_state)
+            return new_state
+
