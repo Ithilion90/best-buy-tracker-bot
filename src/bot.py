@@ -739,28 +739,31 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             new_only_indicator = "🆕 NEW ONLY" if new_only else ""
             
             # Build product message with uniform formatting (no separators)
+            # ALWAYS show same number of lines for uniform card height
             product_lines = [f"<b>{i}.</b> {clickable}"]
-            if new_only_indicator:
-                product_lines.append(f"     {new_only_indicator}")
             
+            # Line 2: NEW ONLY indicator or empty space (for uniform height)
+            product_lines.append(f"     {new_only_indicator}" if new_only_indicator else "")
+            
+            # Line 3: Domain (always shown)
             product_lines.append(f"🌍 <b>Domain:</b> {dom or 'n/a'}")
             
-            if stock_line:
-                product_lines.append(f"📦 <b>Status:</b> {stock_line}")
-            else:
-                # Add placeholder to keep uniform height
-                product_lines.append(f"📦 <b>Status:</b> ✅ In stock")
+            # Line 4: Status (always shown with placeholder if empty)
+            product_lines.append(f"📦 <b>Status:</b> {stock_line}" if stock_line else "📦 <b>Status:</b> ✅ In stock")
             
+            # Line 5: Current Price (always shown, with placeholder if unavailable)
             show_preorder_price = os.getenv('SHOW_PRICE_WHEN_PREORDER', 'true').lower() in ('1', 'true', 'yes', 'y')
             if avail == 'unavailable':
-                # Keep uniform height with placeholder
                 product_lines.append(f"💰 <b>Current:</b> —")
             elif avail == 'preorder' and not show_preorder_price:
                 product_lines.append(f"💰 <b>Current:</b> —")
             else:
                 product_lines.append(f"💰 <b>Current:</b> {format_price(cur_p, curr_row)}")
             
+            # Line 6: Historical Min (always shown)
             product_lines.append(f"📉 <b>Historical Min:</b> {format_price(min_p, curr_row)}")
+            
+            # Line 7: Historical Max (always shown)
             product_lines.append(f"📈 <b>Historical Max:</b> {format_price(max_p, curr_row)}")
             
             # Create toggle button for this product
@@ -1021,17 +1024,19 @@ async def handle_toggle_new_only(update: Update, context: ContextTypes.DEFAULT_T
             ])
         else:
             # Build message in "/list" format (no separators)
+            # ALWAYS show same number of lines for uniform card height
             product_lines = [f"<b>{product_num}.</b> {clickable}"]
-            if new_only_indicator:
-                product_lines.append(f"     {new_only_indicator}")
             
+            # Line 2: NEW ONLY indicator or empty space (for uniform height)
+            product_lines.append(f"     {new_only_indicator}" if new_only_indicator else "")
+            
+            # Line 3: Domain (always shown)
             product_lines.append(f"🌍 <b>Domain:</b> {dom or 'n/a'}")
             
-            if stock_line:
-                product_lines.append(f"📦 <b>Status:</b> {stock_line}")
-            else:
-                product_lines.append(f"📦 <b>Status:</b> ✅ In stock")
+            # Line 4: Status (always shown with placeholder if empty)
+            product_lines.append(f"📦 <b>Status:</b> {stock_line}" if stock_line else "📦 <b>Status:</b> ✅ In stock")
             
+            # Line 5: Current Price (always shown, with placeholder if unavailable)
             show_preorder_price = os.getenv('SHOW_PRICE_WHEN_PREORDER', 'true').lower() in ('1', 'true', 'yes', 'y')
             if avail == 'unavailable':
                 product_lines.append(f"💰 <b>Current:</b> —")
@@ -1040,7 +1045,10 @@ async def handle_toggle_new_only(update: Update, context: ContextTypes.DEFAULT_T
             else:
                 product_lines.append(f"💰 <b>Current:</b> {format_price(cur_p, curr_row)}")
             
+            # Line 6: Historical Min (always shown)
             product_lines.append(f"📉 <b>Historical Min:</b> {format_price(min_p, curr_row)}")
+            
+            # Line 7: Historical Max (always shown)
             product_lines.append(f"📈 <b>Historical Max:</b> {format_price(max_p, curr_row)}")
         
         # Update button text
