@@ -610,14 +610,36 @@ async def handle_shared_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 spinner_stop_1.set()
         except Exception:
             pass
+        
+        # Create button for Track NEW Only toggle
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🆕 Track NEW Only", callback_data=f"toggle_new_{item_id}")
+        ]])
+        
         if image_url:
             try:
                 await msg.delete()
-                await context.bot.send_photo(chat_id=user.id, photo=image_url, caption=response, parse_mode="HTML")
+                await context.bot.send_photo(
+                    chat_id=user.id, 
+                    photo=image_url, 
+                    caption=response, 
+                    parse_mode="HTML",
+                    reply_markup=keyboard
+                )
             except Exception:
-                await msg.edit_text(response, parse_mode="HTML", disable_web_page_preview=True)
+                await msg.edit_text(
+                    response, 
+                    parse_mode="HTML", 
+                    disable_web_page_preview=True,
+                    reply_markup=keyboard
+                )
         else:
-            await msg.edit_text(response, parse_mode="HTML", disable_web_page_preview=True)
+            await msg.edit_text(
+                response, 
+                parse_mode="HTML", 
+                disable_web_page_preview=True,
+                reply_markup=keyboard
+            )
         logger.info("Product added via shared link", asin=asin, domain=domain, title=title[:30], current_price=current_price, min_price=corrected_min, max_price=corrected_max)
         
     except Exception as e:
@@ -693,7 +715,7 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 continue
             
             title_full = r['title'] or f"Product {asin}"
-            title_disp = truncate(title_full, 40)
+            title_disp = truncate(title_full, 45)  # Increased from 40 to 45 for uniformity
             # Use /dp/ URL with affiliate tag and title for better routing
             dom_for_url = dom or 'amazon.it'
             aff_url = build_product_url(dom_for_url, asin, title_full)
@@ -716,26 +738,37 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             new_only = r.get('new_only', 0)
             new_only_indicator = "🆕 NEW ONLY" if new_only else ""
             
-            # Build product message
-            product_lines = [f"<b>{i}.</b> {clickable}"]
+            # Build product message with fixed width for uniformity
+            # Using separator line and consistent formatting
+            separator = "─" * 40
+            product_lines = [
+                separator,
+                f"<b>{i}.</b> {clickable}"
+            ]
             if new_only_indicator:
-                product_lines[0] += f" {new_only_indicator}"
+                product_lines.append(f"     {new_only_indicator}")
             
+            product_lines.append(separator)
             product_lines.append(f"🌍 <b>Domain:</b> {dom or 'n/a'}")
             
             if stock_line:
                 product_lines.append(f"📦 <b>Status:</b> {stock_line}")
+            else:
+                # Add placeholder to keep uniform height
+                product_lines.append(f"📦 <b>Status:</b> ✅ In stock")
             
             show_preorder_price = os.getenv('SHOW_PRICE_WHEN_PREORDER', 'true').lower() in ('1', 'true', 'yes', 'y')
             if avail == 'unavailable':
-                pass
+                # Keep uniform height with placeholder
+                product_lines.append(f"💰 <b>Current:</b> —")
             elif avail == 'preorder' and not show_preorder_price:
-                pass
+                product_lines.append(f"💰 <b>Current:</b> —")
             else:
                 product_lines.append(f"💰 <b>Current:</b> {format_price(cur_p, curr_row)}")
             
             product_lines.append(f"📉 <b>Historical Min:</b> {format_price(min_p, curr_row)}")
             product_lines.append(f"📈 <b>Historical Max:</b> {format_price(max_p, curr_row)}")
+            product_lines.append(separator)
             
             # Create toggle button for this product
             item_id = r.get('id')
@@ -970,26 +1003,59 @@ async def handle_toggle_new_only(update: Update, context: ContextTypes.DEFAULT_T
         new_only = new_state
         new_only_indicator = "🆕 NEW ONLY" if new_only else ""
         
-        # Build product message
-        product_lines = [f"<b>{product_num}.</b> {clickable}"]
-        if new_only_indicator:
-            product_lines[0] += f" {new_only_indicator}"
+        # Detect message format: "Product Added" vs "/list" format
+        original_text = query.message.caption if query.message.photo else query.message.text
+        is_product_added = original_text and "Product Added" in original_text
         
-        product_lines.append(f"🌍 <b>Domain:</b> {dom or 'n/a'}")
-        
-        if stock_line:
-            product_lines.append(f"📦 <b>Status:</b> {stock_line}")
-        
-        show_preorder_price = os.getenv('SHOW_PRICE_WHEN_PREORDER', 'true').lower() in ('1', 'true', 'yes', 'y')
-        if avail == 'unavailable':
-            pass
-        elif avail == 'preorder' and not show_preorder_price:
-            pass
+        if is_product_added:
+            # Build message in "Product Added" format
+            title_display = truncate(title_full, 60)
+            clickable_title = f"<a href=\"{aff_url}\">{title_display}</a>"
+            
+            product_lines = [
+                "✅ <b>Product Added!</b>",
+                "",
+                f"📦 {clickable_title}"
+            ]
+            if new_only_indicator:
+                product_lines.append(f"     {new_only_indicator}")
+            
+            product_lines.extend([
+                f"💰 <b>Current Price:</b> {format_price(cur_p, curr_row)}",
+                f"📉 <b>Historical Min:</b> {format_price(min_p, curr_row)}",
+                f"📈 <b>Historical Max:</b> {format_price(max_p, curr_row)}",
+                "",
+                "📢 <b>You'll be notified when the price change!</b>"
+            ])
         else:
-            product_lines.append(f"💰 <b>Current:</b> {format_price(cur_p, curr_row)}")
-        
-        product_lines.append(f"📉 <b>Historical Min:</b> {format_price(min_p, curr_row)}")
-        product_lines.append(f"📈 <b>Historical Max:</b> {format_price(max_p, curr_row)}")
+            # Build message in "/list" format with separators
+            separator = "─" * 40
+            product_lines = [
+                separator,
+                f"<b>{product_num}.</b> {clickable}"
+            ]
+            if new_only_indicator:
+                product_lines.append(f"     {new_only_indicator}")
+            
+            product_lines.append(separator)
+            product_lines.append(f"🌍 <b>Domain:</b> {dom or 'n/a'}")
+            
+            if stock_line:
+                product_lines.append(f"📦 <b>Status:</b> {stock_line}")
+            else:
+                product_lines.append(f"📦 <b>Status:</b> ✅ In stock")
+            
+            show_preorder_price = os.getenv('SHOW_PRICE_WHEN_PREORDER', 'true').lower() in ('1', 'true', 'yes', 'y')
+            if avail == 'unavailable':
+                product_lines.append(f"💰 <b>Current:</b> —")
+            elif avail == 'preorder' and not show_preorder_price:
+                product_lines.append(f"💰 <b>Current:</b> —")
+            else:
+                product_lines.append(f"💰 <b>Current:</b> {format_price(cur_p, curr_row)}")
+            
+            product_lines.append(f"📉 <b>Historical Min:</b> {format_price(min_p, curr_row)}")
+            product_lines.append(f"📈 <b>Historical Max:</b> {format_price(max_p, curr_row)}")
+            product_lines.append(separator)
         
         # Update button text
         button_text = "❌ Track ALL" if new_only else "🆕 Track NEW Only"
@@ -997,19 +1063,49 @@ async def handle_toggle_new_only(update: Update, context: ContextTypes.DEFAULT_T
             InlineKeyboardButton(button_text, callback_data=f"toggle_new_{item_id}")
         ]])
         
-        # Update the message
-        await query.edit_message_text(
-            "\n".join(product_lines),
-            parse_mode="HTML",
-            disable_web_page_preview=True,
-            reply_markup=keyboard
-        )
+        # Update the message - check if it has a photo (caption) or text
+        message_text = "\n".join(product_lines)
+        try:
+            if query.message.photo:
+                # Message has photo, update caption
+                await query.edit_message_caption(
+                    caption=message_text,
+                    parse_mode="HTML",
+                    reply_markup=keyboard
+                )
+            else:
+                # Message is text only
+                await query.edit_message_text(
+                    message_text,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                    reply_markup=keyboard
+                )
+        except Exception as edit_err:
+            logger.warning("Failed to edit message, trying alternative", error=str(edit_err))
+            # Fallback: try the other method
+            try:
+                await query.edit_message_text(
+                    message_text,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                    reply_markup=keyboard
+                )
+            except Exception:
+                await query.edit_message_caption(
+                    caption=message_text,
+                    parse_mode="HTML",
+                    reply_markup=keyboard
+                )
         
         logger.info("Toggled new_only via callback", item_id=item_id, user_id=user.id, new_state=new_state)
         
     except Exception as e:
         logger.error("Error toggling new_only", error=str(e), item_id=item_id, user_id=user.id)
-        await query.edit_message_text("❌ Error updating setting. Please try again.")
+        try:
+            await query.answer("❌ Error updating setting. Please try again.", show_alert=True)
+        except Exception:
+            pass
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Log errors"""
