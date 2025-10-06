@@ -106,17 +106,14 @@ def build_product_url(domain: str, asin: str, title: str | None = None) -> str:
     
     Returns:
         URL to product page with affiliate tag and ref parameter
+    
+    Note:
+        Uses /gp/product/ format which is more reliable than /dp/ for some ASINs
+        that might redirect to "Recently Viewed" page.
     """
-    # Build URL with optional title in path (Amazon's preferred format)
-    if title:
-        # Create URL-safe slug from title
-        import re
-        slug = re.sub(r'[^\w\s-]', '', title.lower())  # Remove special chars
-        slug = re.sub(r'[\s_]+', '-', slug)  # Replace spaces with hyphens
-        slug = slug[:80]  # Limit length
-        base_url = f"https://{domain}/{slug}/dp/{asin}"
-    else:
-        base_url = f"https://{domain}/dp/{asin}"
+    # Use /gp/product/ format (more reliable than /dp/)
+    # This format works better for products that might have routing issues
+    base_url = f"https://{domain}/gp/product/{asin}"
     
     # Add affiliate tag via with_affiliate
     url_with_tag = with_affiliate(base_url)
