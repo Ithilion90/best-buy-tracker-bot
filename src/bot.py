@@ -4,7 +4,7 @@ import re
 import asyncio
 import os
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters, CallbackQueryHandler
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 # Imports
 try:
@@ -204,16 +204,14 @@ async def refresh_prices_and_notify(app: Application) -> None:
         items = db.get_all_items()
         if not items:
             return
-        # Group items: (domain, new_only) -> asin -> list[item rows]
-        # This ensures we make separate Keepa calls for NEW vs ALL condition tracking
-        domain_group: dict[tuple[str, bool], dict[str, list[dict]]] = {}
+        # Group items by domain only
+        domain_group: dict[str, dict[str, list[dict]]] = {}
         for it in items:
             asin = it.get('asin')
             if not asin:
                 continue
             dom = it.get('domain') or extract_domain(it.get('url') or '') or (getattr(config, 'keepa_domain', 'amazon.com'))
-            new_only = bool(it.get('new_only', 0))  # Get new_only flag from DB
-            domain_group.setdefault((dom, new_only), {}).setdefault(asin, []).append(it)
+            domain_group.setdefault(dom, {}).setdefault(asin, []).append(it)
         if not domain_group:
             return
 
@@ -234,10 +232,10 @@ async def refresh_prices_and_notify(app: Application) -> None:
                     return asin, None, None, None, None
 
         updated_items = 0
-        for (dom, new_only), asin_map in domain_group.items():
+        for dom, asin_map in domain_group.items():
             asins_dom = list(asin_map.keys())
-            # Pass new_only flag to Keepa client
-            keepa_bounds_dom = fetch_lifetime_min_max_current(asins_dom, domain=dom, new_only=new_only)
+            # Fetch prices for NEW+USED (all sellers)
+            keepa_bounds_dom = fetch_lifetime_min_max_current(asins_dom, domain=dom, new_only=False)
             # Scrape concurrently (first URL per asin)
             tasks = [scrape(a, lst[0].get('url')) for a, lst in asin_map.items() if lst and lst[0].get('url')]
             scrape_results: dict[str, tuple[str | None, float | None, str | None, str | None]] = {}
@@ -625,11 +623,6 @@ async def handle_shared_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
         except Exception:
             pass
         
-        # Create button for Track NEW Only toggle
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("🆕 Track NEW Only", callback_data=f"toggle_new_{item_id}")
-        ]])
-        
         if image_url:
             try:
                 await msg.delete()
@@ -637,22 +630,19 @@ async def handle_shared_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     chat_id=user.id, 
                     photo=image_url, 
                     caption=response, 
-                    parse_mode="HTML",
-                    reply_markup=keyboard
+                    parse_mode="HTML"
                 )
             except Exception:
                 await msg.edit_text(
                     response, 
                     parse_mode="HTML", 
-                    disable_web_page_preview=True,
-                    reply_markup=keyboard
+                    disable_web_page_preview=True
                 )
         else:
             await msg.edit_text(
                 response, 
                 parse_mode="HTML", 
-                disable_web_page_preview=True,
-                reply_markup=keyboard
+                disable_web_page_preview=True
             )
         logger.info("Product added via shared link", asin=asin, domain=domain, title=title[:30], current_price=current_price, min_price=corrected_min, max_price=corrected_max)
         
@@ -748,24 +738,17 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             else:
                 stock_line = ""
             
-            # Check new_only status
-            new_only = r.get('new_only', 0)
-            new_only_indicator = "🆕 NEW ONLY" if new_only else "🔄 NEW + USED"
-            
             # Build product message with uniform formatting (no separators)
             # ALWAYS show same number of lines for uniform card height
             product_lines = [f"<b>{i}.</b> {clickable}"]
             
-            # Line 2: Tracking mode indicator (always shown for uniform height, aligned with other fields)
-            product_lines.append(f"🔍 <b>Tracking:</b> {new_only_indicator}")
-            
-            # Line 3: Domain (always shown)
+            # Line 2: Domain (always shown)
             product_lines.append(f"🌍 <b>Domain:</b> {dom or 'n/a'}")
             
-            # Line 4: Status (always shown with placeholder if empty)
+            # Line 3: Status (always shown with placeholder if empty)
             product_lines.append(f"📦 <b>Status:</b> {stock_line}" if stock_line else "📦 <b>Status:</b> ✅ In stock")
             
-            # Line 5: Current Price (always shown, with placeholder if unavailable)
+            # Line 4: Current Price (always shown, with placeholder if unavailable)
             show_preorder_price = os.getenv('SHOW_PRICE_WHEN_PREORDER', 'true').lower() in ('1', 'true', 'yes', 'y')
             if avail == 'unavailable':
                 product_lines.append(f"💰 <b>Current:</b> —")
@@ -774,25 +757,17 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             else:
                 product_lines.append(f"💰 <b>Current:</b> {format_price(cur_p, curr_row)}")
             
-            # Line 6: Historical Min (always shown)
+            # Line 5: Historical Min (always shown)
             product_lines.append(f"📉 <b>Historical Min:</b> {format_price(min_p, curr_row)}")
             
-            # Line 7: Historical Max (always shown)
+            # Line 6: Historical Max (always shown)
             product_lines.append(f"📈 <b>Historical Max:</b> {format_price(max_p, curr_row)}")
             
-            # Create toggle button for this product
-            item_id = r.get('id')
-            button_text = "🔄 Track ALL (New + Used)" if new_only else "🆕 Track NEW Only"
-            keyboard = InlineKeyboardMarkup([[
-                InlineKeyboardButton(button_text, callback_data=f"toggle_new_{item_id}")
-            ]])
-            
-            # Send product message with button
+            # Send product message
             await update.message.reply_text(
                 "\n".join(product_lines),
                 parse_mode="HTML",
-                disable_web_page_preview=True,
-                reply_markup=keyboard
+                disable_web_page_preview=True
             )
     except Exception as e:
         logger.error("Error in list command", error=str(e))
@@ -912,208 +887,6 @@ async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             parse_mode="HTML"
         )
 
-async def handle_toggle_new_only(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle toggle new_only button callback"""
-    query = update.callback_query
-    
-    user = update.effective_user
-    if not user:
-        await query.answer("❌ User not found", show_alert=True)
-        return
-    
-    # Parse callback data: "toggle_new_{item_id}"
-    try:
-        item_id = int(query.data.split('_')[-1])
-    except (ValueError, IndexError):
-        await query.answer("❌ Invalid callback data", show_alert=True)
-        return
-    
-    # Show loading indicator immediately
-    await query.answer("🔄 Updating prices...")
-    
-    # Toggle new_only flag
-    try:
-        new_state = db.toggle_new_only(item_id, user.id)
-        
-        # Get the updated item data
-        rows = db.list_items(user.id)
-        item = next((r for r in rows if r.get('id') == item_id), None)
-        
-        if not item:
-            await query.edit_message_text("❌ Product not found")
-            return
-        
-        # IMPORTANT: Fetch fresh prices from Keepa with the new filter
-        asin = item.get('asin')
-        dom = item.get('domain') or extract_domain(item.get('url') or '')
-        
-        if not asin:
-            await query.edit_message_text("❌ Invalid product data")
-            return
-        
-        # Fetch prices with new_only filter
-        try:
-            keepa_data = fetch_lifetime_min_max_current([asin], domain=dom, new_only=new_state)
-            if asin in keepa_data:
-                k_min, k_max, k_cur = keepa_data[asin]
-                if k_min and k_max and k_cur:
-                    # Update DB with new prices
-                    db.update_price_bounds(item_id, k_min, k_max)
-                    db.update_price(item_id, k_cur)
-                    min_p, max_p, cur_p = k_min, k_max, k_cur
-                else:
-                    # Fallback to existing prices if Keepa returns None
-                    min_p = item.get('min_price')
-                    max_p = item.get('max_price')
-                    cur_p = item.get('last_price') or (min_p and max_p and (min_p + max_p) / 2)
-            else:
-                # Fallback if ASIN not in results
-                min_p = item.get('min_price')
-                max_p = item.get('max_price')
-                cur_p = item.get('last_price') or (min_p and max_p and (min_p + max_p) / 2)
-        except Exception as e:
-            logger.warning("Keepa fetch failed during toggle", error=str(e), asin=asin)
-            # Fallback to existing prices
-            min_p = item.get('min_price')
-            max_p = item.get('max_price')
-            cur_p = item.get('last_price') or (min_p and max_p and (min_p + max_p) / 2)
-        
-        if not (isinstance(min_p, (int, float)) and isinstance(max_p, (int, float)) and isinstance(cur_p, (int, float))):
-            title = truncate(item['title'] or f"Product {asin}", 40)
-            await query.edit_message_text(
-                f"<b>{title}</b>\n❌ Data unavailable yet",
-                parse_mode="HTML"
-            )
-            return
-        
-        # Find the product number (position in list)
-        product_num = next((i for i, r in enumerate(rows, 1) if r.get('id') == item_id), 1)
-        
-        title_full = item['title'] or f"Product {asin}"
-        title_disp = truncate(title_full, 40)
-        dom_for_url = dom or 'amazon.it'
-        aff_url = build_product_url(dom_for_url, asin, title_full)
-        clickable = f"<a href=\"{aff_url}\">{title_disp}</a>"
-        curr_row = item.get('currency') or domain_to_currency(dom)
-        
-        avail = (item.get('availability') or '').lower()
-        if avail == 'unavailable':
-            stock_line = "❌ Not available"
-        elif avail == 'preorder':
-            stock_line = "🕒 Pre-order"
-        elif avail == 'in_stock':
-            stock_line = "✅ In stock"
-        elif avail:
-            stock_line = f"ℹ️ {avail}"
-        else:
-            stock_line = ""
-        
-        # Check new_only status (now updated)
-        new_only = new_state
-        new_only_indicator = "🆕 NEW ONLY" if new_only else "🔄 NEW + USED"
-        
-        # Detect message format: "Product Added" vs "/list" format
-        original_text = query.message.caption if query.message.photo else query.message.text
-        is_product_added = original_text and "Product Added" in original_text
-        
-        if is_product_added:
-            # Build message in "Product Added" format
-            title_display = truncate(title_full, 60)
-            clickable_title = f"<a href=\"{aff_url}\">{title_display}</a>"
-            
-            product_lines = [
-                "✅ <b>Product Added!</b>",
-                "",
-                f"📦 {clickable_title}",
-                f"🔍 <b>Tracking:</b> {new_only_indicator}"
-            ]
-            
-            product_lines.extend([
-                f"💰 <b>Current Price:</b> {format_price(cur_p, curr_row)}",
-                f"📉 <b>Historical Min:</b> {format_price(min_p, curr_row)}",
-                f"📈 <b>Historical Max:</b> {format_price(max_p, curr_row)}",
-                "",
-                "📢 <b>You'll be notified when the price change!</b>"
-            ])
-        else:
-            # Build message in "/list" format (no separators)
-            # ALWAYS show same number of lines for uniform card height
-            product_lines = [f"<b>{product_num}.</b> {clickable}"]
-            
-            # Line 2: Tracking mode indicator (always shown for uniform height, aligned with other fields)
-            product_lines.append(f"🔍 <b>Tracking:</b> {new_only_indicator}")
-            
-            # Line 3: Domain (always shown)
-            product_lines.append(f"🌍 <b>Domain:</b> {dom or 'n/a'}")
-            
-            # Line 4: Status (always shown with placeholder if empty)
-            product_lines.append(f"📦 <b>Status:</b> {stock_line}" if stock_line else "📦 <b>Status:</b> ✅ In stock")
-            
-            # Line 5: Current Price (always shown, with placeholder if unavailable)
-            show_preorder_price = os.getenv('SHOW_PRICE_WHEN_PREORDER', 'true').lower() in ('1', 'true', 'yes', 'y')
-            if avail == 'unavailable':
-                product_lines.append(f"💰 <b>Current:</b> —")
-            elif avail == 'preorder' and not show_preorder_price:
-                product_lines.append(f"💰 <b>Current:</b> —")
-            else:
-                product_lines.append(f"💰 <b>Current:</b> {format_price(cur_p, curr_row)}")
-            
-            # Line 6: Historical Min (always shown)
-            product_lines.append(f"📉 <b>Historical Min:</b> {format_price(min_p, curr_row)}")
-            
-            # Line 7: Historical Max (always shown)
-            product_lines.append(f"📈 <b>Historical Max:</b> {format_price(max_p, curr_row)}")
-        
-        # Update button text
-        button_text = "🔄 Track ALL (New + Used)" if new_only else "🆕 Track NEW Only"
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton(button_text, callback_data=f"toggle_new_{item_id}")
-        ]])
-        
-        # Update the message - check if it has a photo (caption) or text
-        message_text = "\n".join(product_lines)
-        try:
-            if query.message.photo:
-                # Message has photo, update caption
-                await query.edit_message_caption(
-                    caption=message_text,
-                    parse_mode="HTML",
-                    reply_markup=keyboard
-                )
-            else:
-                # Message is text only
-                await query.edit_message_text(
-                    message_text,
-                    parse_mode="HTML",
-                    disable_web_page_preview=True,
-                    reply_markup=keyboard
-                )
-        except Exception as edit_err:
-            logger.warning("Failed to edit message, trying alternative", error=str(edit_err))
-            # Fallback: try the other method
-            try:
-                await query.edit_message_text(
-                    message_text,
-                    parse_mode="HTML",
-                    disable_web_page_preview=True,
-                    reply_markup=keyboard
-                )
-            except Exception:
-                await query.edit_message_caption(
-                    caption=message_text,
-                    parse_mode="HTML",
-                    reply_markup=keyboard
-                )
-        
-        logger.info("Toggled new_only via callback", item_id=item_id, user_id=user.id, new_state=new_state)
-        
-    except Exception as e:
-        logger.error("Error toggling new_only", error=str(e), item_id=item_id, user_id=user.id)
-        try:
-            await query.answer("❌ Error updating setting. Please try again.", show_alert=True)
-        except Exception:
-            pass
-
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Log errors"""
     logger.error("Bot error", error=str(context.error))
@@ -1147,9 +920,6 @@ def main() -> None:
         await application.bot.set_my_commands(commands)
     
     app.post_init = set_commands
-    
-    # Callback query handler for inline buttons
-    app.add_handler(CallbackQueryHandler(handle_toggle_new_only, pattern=r'^toggle_new_\d+$'))
     
     # Debug DB command (temporary) to verify persistence
     async def cmd_debugdb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
