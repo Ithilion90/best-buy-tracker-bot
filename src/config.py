@@ -29,7 +29,10 @@ class Config:
     user_agent: str = os.getenv("USER_AGENT", "Mozilla/5.0")
     # Affiliate
     affiliate_tag: str = os.getenv("AFFILIATE_TAG", "bestbuytracker-21")
-    # Keepa (optional)
+    # Amazon Product Advertising API (PA API 5.0) - LEGAL alternative to scraping
+    amazon_access_key: str = os.getenv("AMAZON_ACCESS_KEY", "")
+    amazon_secret_key: str = os.getenv("AMAZON_SECRET_KEY", "")
+    # Keepa (optional, for historical price data)
     keepa_api_key: str = os.getenv("KEEPA_API_KEY", "")
     keepa_domain: str = os.getenv("KEEPA_DOMAIN", "it")  # e.g., com, it, de
 
@@ -44,6 +47,17 @@ def validate_config() -> None:
     # Basic sanity check: Telegram tokens are of the form <digits>:<alphanum>
     if ":" not in token:
         raise RuntimeError("BOT_TOKEN format looks invalid. Get a valid token from @BotFather.")
+    
+    # Validate Amazon PA API credentials
+    if not config.amazon_access_key or not config.amazon_secret_key:
+        raise RuntimeError(
+            "Amazon Product Advertising API credentials not set.\n"
+            "Add to .env:\n"
+            "  AMAZON_ACCESS_KEY=<your access key>\n"
+            "  AMAZON_SECRET_KEY=<your secret key>\n"
+            "Get credentials from: https://webservices.amazon.com/paapi5/documentation/register-for-pa-api.html"
+        )
+    
     # Normalize database_path for frozen executables when relative
     if not os.path.isabs(config.database_path):
         base_dir = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.getcwd()

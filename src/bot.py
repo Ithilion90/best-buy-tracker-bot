@@ -12,6 +12,7 @@ try:
     from src.config import config, validate_config
     from src.logger import logger
     from src.keepa_client import fetch_lifetime_min_max, fetch_lifetime_min_max_current
+    from src.amazon_api import fetch_product_data_legal
     from src.utils import (
         extract_asin,
         with_affiliate,
@@ -21,12 +22,12 @@ try:
         domain_to_currency,
         format_price,
     )
-    from src.price_fetcher import fetch_price_title_image
 except ImportError:
-    import db
+    from db import db
     from config import config, validate_config
     from logger import logger
     from keepa_client import fetch_lifetime_min_max, fetch_lifetime_min_max_current
+    from amazon_api import fetch_product_data_legal
     from utils import (
         extract_asin,
         with_affiliate,
@@ -36,7 +37,6 @@ except ImportError:
         domain_to_currency,
         format_price,
     )
-    from price_fetcher import fetch_price_title_image
 
 AMAZON_URL_RE = re.compile(
     r'((?:https?://)?(?:www\.|m\.|smile\.)?(?:amzn\.to|amzn\.eu|amzn\.in|a\.co|amzn\.asia|amazon\.(?:com|co\.uk|de|fr|it|es|ca|co\.jp|in|com\.mx))/[^\s]+)',
@@ -159,16 +159,14 @@ async def send_price_notification(user_id: int, asin: str, title: str, old_price
                 f"{seller_hint}"
             )
 
-        # Try to fetch image (scrape on-demand). Not cached to keep simple (caching would be feature 2).
+        # Try to fetch image using Amazon PA API (legal method)
         image_url: Optional[str] = None
         try:
-            from src.price_fetcher import fetch_price_title_image  # local import to avoid cycles
-        except ImportError:
-            from price_fetcher import fetch_price_title_image  # type: ignore
-        try:
-            _t, _p, _c, img = await fetch_price_title_image(aff_url)
+            # Fetch product data from PA API to get image
+            _title, _price, _currency, img, _avail = fetch_product_data_legal(asin, dom)
             image_url = img
-        except Exception:
+        except Exception as e:
+            logger.warning("Could not fetch image from PA API", error=str(e))
             image_url = None
 
         def _thumbnail(u: Optional[str]) -> Optional[str]:
@@ -217,18 +215,15 @@ async def refresh_prices_and_notify(app: Application) -> None:
 
         sem = asyncio.Semaphore(10)
 
-        async def scrape(asin: str, url: str):
+        async def fetch_current_data(asin: str, domain: str):
+            """Fetch current product data from Amazon PA API (legal method)"""
             async with sem:
                 try:
-                    # Prefer function that also returns availability if present
-                    try:
-                        from src.price_fetcher import fetch_price_title_image_and_availability  # type: ignore
-                    except ImportError:
-                        from price_fetcher import fetch_price_title_image_and_availability  # type: ignore
-                    title_s, price_s, currency_s, _img, avail = await fetch_price_title_image_and_availability(url)
+                    # Use PA API instead of scraping (100% legal)
+                    title_s, price_s, currency_s, _img, avail = fetch_product_data_legal(asin, domain)
                     return asin, title_s, price_s, currency_s, avail
                 except Exception as e:
-                    logger.warning("Refresh scrape failed", asin=asin, error=str(e))
+                    logger.warning("PA API fetch failed", asin=asin, domain=domain, error=str(e))
                     return asin, None, None, None, None
 
         updated_items = 0
@@ -236,35 +231,35 @@ async def refresh_prices_and_notify(app: Application) -> None:
             asins_dom = list(asin_map.keys())
             # Fetch prices for NEW+USED (all sellers)
             keepa_bounds_dom = fetch_lifetime_min_max_current(asins_dom, domain=dom, new_only=False)
-            # Scrape concurrently (first URL per asin)
-            tasks = [scrape(a, lst[0].get('url')) for a, lst in asin_map.items() if lst and lst[0].get('url')]
-            scrape_results: dict[str, tuple[str | None, float | None, str | None, str | None]] = {}
+            # Fetch current data from PA API concurrently
+            tasks = [fetch_current_data(a, dom) for a in asins_dom]
+            api_results: dict[str, tuple[str | None, float | None, str | None, str | None]] = {}
             if tasks:
                 for asin, t, p, c, a in await asyncio.gather(*tasks):
-                    scrape_results[asin] = (t, p, c, a)
+                    api_results[asin] = (t, p, c, a)
 
             for asin, lst in asin_map.items():
                 k_min, k_max, k_cur = keepa_bounds_dom.get(asin, (None, None, None)) if keepa_bounds_dom else (None, None, None)
-                scraped_title, scraped_price, scraped_currency, scraped_avail = scrape_results.get(asin, (None, None, None, None))
+                api_title, api_price, api_currency, api_avail = api_results.get(asin, (None, None, None, None))
                 
-                # Validate scraped price currency matches expected domain currency
+                # Validate API price currency matches expected domain currency
                 expected_currency = domain_to_currency(dom)
-                if scraped_price is not None and scraped_currency and scraped_currency != expected_currency:
+                if api_price is not None and api_currency and api_currency != expected_currency:
                     logger.warning(
-                        "Scraped currency mismatch - discarding scraped price",
+                        "PA API currency mismatch - discarding price",
                         asin=asin,
                         domain=dom,
                         expected=expected_currency,
-                        got=scraped_currency,
-                        price=scraped_price
+                        got=api_currency,
+                        price=api_price
                     )
-                    # Discard scraped price if currency doesn't match
-                    scraped_price = None
+                    # Discard API price if currency doesn't match
+                    api_price = None
 
                 # Fallback if keepa missing
                 if k_min is None or k_max is None:
-                    if scraped_price is not None:
-                        k_min = k_max = scraped_price
+                    if api_price is not None:
+                        k_min = k_max = api_price
                     elif k_cur is not None:
                         k_min = k_max = k_cur
                     else:
@@ -274,16 +269,16 @@ async def refresh_prices_and_notify(app: Application) -> None:
                 if k_min is None or k_max is None:
                     continue
 
-                current_price = scraped_price if scraped_price is not None else (k_cur if k_cur is not None else (k_min + k_max) / 2)
+                current_price = api_price if api_price is not None else (k_cur if k_cur is not None else (k_min + k_max) / 2)
                 adj_min, adj_max = validate_price_consistency(current_price, k_min, k_max)
 
                 for item in lst:
                     old_price = item.get('last_price')
-                    # Decide availability to persist with Keepa-first policy
+                    # Decide availability to persist with PA API data
                     to_avail = None
-                    # Persist only explicit availability from scraper; do not infer in-stock from prices
-                    if scraped_avail in ('unavailable', 'preorder', 'in_stock'):
-                        to_avail = scraped_avail
+                    # Persist only explicit availability from PA API
+                    if api_avail in ('unavailable', 'preorder', 'available', 'in_stock'):
+                        to_avail = api_avail
                     
                     # Skip notifications if product is unavailable
                     should_notify = to_avail != 'unavailable'
@@ -305,7 +300,7 @@ async def refresh_prices_and_notify(app: Application) -> None:
                             await send_price_notification(
                                 item['user_id'],
                                 asin,
-                                item.get('title') or (scraped_title or f"Product {asin}"),
+                                item.get('title') or (api_title or f"Product {asin}"),
                                 old_price,
                                 current_price,
                                 adj_min,
@@ -332,7 +327,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await cmd_help(update, context)
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Help command with bot logo"""
+    """Help command with bot logo and legal disclaimer"""
     # Amazon-themed logo URL - Shopping cart with price tag
     # TODO: Replace with your custom logo URL
     logo_url = "https://raw.githubusercontent.com/Ithilion90/best-buy-tracker-bot/main/assets/bot-logo.png"
@@ -346,7 +341,14 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/remove all — Remove all tracked products\n"
         "/help — Show this guide\n\n"
         "💡 <b>Tip:</b> Share an Amazon link to add it automatically!\n"
-        "📢 <b>Notifications:</b> You'll be alerted when prices drop!"
+        "📢 <b>Notifications:</b> You'll be alerted when prices drop!\n\n"
+        "⚖️ <b>Legal Notice:</b>\n"
+        "• Prices shown are informational only\n"
+        "• Always verify on Amazon before purchasing\n"
+        "• Product links include affiliate tag\n"
+        "• We use official Amazon PA API (100% legal)\n"
+        "• Not affiliated with Amazon.com, Inc.\n\n"
+        "ℹ️ Full legal notice: /legal"
     )
     
     try:
@@ -358,6 +360,47 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception:
         # Fallback to text-only if image fails
         await update.message.reply_text(help_text, parse_mode="HTML")
+
+async def cmd_legal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Legal notice and compliance information"""
+    legal_text = (
+        "⚖️ <b>Legal Notice &amp; Compliance</b>\n\n"
+        "<b>🔒 100% Legal Data Sources:</b>\n\n"
+        "1️⃣ <b>Amazon Product Advertising API</b>\n"
+        "   • Official Amazon API (PA API 5.0)\n"
+        "   • Authorized under Associates Program\n"
+        "   • Used for: current prices, titles, images\n\n"
+        "2️⃣ <b>Keepa API</b> (Historical Data)\n"
+        "   • Third-party price history service\n"
+        "   • Used for: min/max historical prices\n\n"
+        "<b>❌ What We DON'T Do:</b>\n"
+        "   • NO web scraping\n"
+        "   • NO unauthorized data collection\n"
+        "   • NO ToS violations\n\n"
+        "<b>🔐 Your Privacy:</b>\n"
+        "   • User ID stored for bot functionality\n"
+        "   • Tracked products and prices\n"
+        "   • NO personal data sharing\n"
+        "   • GDPR compliant (EU users)\n\n"
+        "<b>💰 Affiliate Disclosure:</b>\n"
+        "   • Product links include affiliate tag\n"
+        "   • We may earn commission on purchases\n"
+        "   • NO extra cost to you\n"
+        "   • Helps cover hosting costs\n\n"
+        "<b>⚠️ Important Disclaimer:</b>\n"
+        "   • Prices are informational only\n"
+        "   • Always verify on Amazon.com\n"
+        "   • Not affiliated with Amazon Inc.\n"
+        "   • Use at your own risk\n\n"
+        "<b>📄 Full Legal Notice:</b>\n"
+        "https://github.com/Ithilion90/best-buy-tracker-bot/blob/main/LEGAL_NOTICE.md\n\n"
+        "<b>📧 Contact:</b>\n"
+        "For legal inquiries or data deletion requests,\n"
+        "contact the bot operator.\n\n"
+        "By using this bot, you agree to these terms."
+    )
+    
+    await update.message.reply_text(legal_text, parse_mode="HTML", disable_web_page_preview=True)
 
 async def handle_shared_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle shared Amazon links - MAIN FUNCTIONALITY.
@@ -509,13 +552,8 @@ async def handle_shared_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
             logger.info("Duplicate link relayed (already tracked)", asin=asin, user_id=user.id, domain=existing_domain, availability=avail_existing)
             return
 
-        # Get product title, current price and image (use resolved URL) - sequential original flow
-        # Prefer scraper that returns availability
-        try:
-            from src.price_fetcher import fetch_price_title_image_and_availability  # type: ignore
-        except ImportError:
-            from price_fetcher import fetch_price_title_image_and_availability  # type: ignore
-        title, current_price, currency, image_url, availability = await fetch_price_title_image_and_availability(url)
+        # Get product title, current price and image using PA API (legal method)
+        title, current_price, currency, image_url, availability = fetch_product_data_legal(asin, domain)
         if not title:
             title = f"Amazon Product {asin}"
 
@@ -905,6 +943,7 @@ def main() -> None:
     # Essential handlers only
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("legal", cmd_legal))
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("remove", cmd_remove))
     
@@ -913,7 +952,8 @@ def main() -> None:
         from telegram import BotCommand
         commands = [
             BotCommand("start", "Start the bot and see help"),
-            BotCommand("help", "Show bot guide and commands"),
+            BotCommand("help", "Show help and available commands"),
+            BotCommand("legal", "Legal notice and compliance info"),
             BotCommand("list", "Show all tracked products"),
             BotCommand("remove", "Remove a tracked product"),
         ]
